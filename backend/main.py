@@ -14,7 +14,8 @@ from .auth_store import AuthUser, authenticate_user, create_session, delete_sess
 from .chat_history_store import ensure_conversation, get_chat_history, list_conversations, save_message as save_chat_message
 from .db import get_session
 from .event_store import delete_user_events, log_promotions, log_raw_event, recent_raw_events
-from .gemini_chat import classify_relation_with_llm, configured_models, extract_triple_candidates, generate_reply_bundle
+from .gemini_chat import analyze_strength_weakness_profile, classify_relation_with_llm, configured_models, extract_triple_candidates, generate_company_planner, generate_reply_bundle
+from .profile_store import delete_user_profile, fetch_profile_summary, upsert_profile_observations
 from .graph.service import graph_memory_service
 from .prompt_router import route_prompt
 from .relation_semantics import classify_relation_semantics, should_background_enrich, store_llm_relation_semantics
@@ -64,27 +65,22 @@ class AuthCredentials(BaseModel):
     password: str = Field(min_length=8)
 
 
+class CompanyPlannerRequest(BaseModel):
+    user_id: str | None = None
+    company: str = Field(min_length=2)
+    days_left: int | None = Field(default=14)
+
+
 @app.on_event("startup")
 def _startup_create_constraints() -> None:
     with get_session() as session:
         _deduplicate_user_nodes(session)
+        _drop_legacy_chat_graph_schema(session)
+        _cleanup_legacy_chat_graph(session)
         _ensure_constraint(
             session,
             "CREATE CONSTRAINT user_id_unique IF NOT EXISTS FOR (u:User) REQUIRE u.id IS UNIQUE",
             "user_id_unique",
-        )
-        _ensure_constraint(
-            session,
-            "CREATE CONSTRAINT convo_id_unique IF NOT EXISTS FOR (c:Conversation) REQUIRE c.id IS UNIQUE",
-            "convo_id_unique",
-        )
-        _ensure_constraint(
-            session,
-            "CREATE CONSTRAINT msg_id_unique IF NOT EXISTS FOR (m:Message) REQUIRE m.id IS UNIQUE",
-            "msg_id_unique",
-        )
-        session.run(
-            "CREATE INDEX message_user_id IF NOT EXISTS FOR (m:Message) ON (m.user_id)"
         )
         graph_memory_service.ensure_schema(session)
         topic_semantic_router.refresh_from_session(session)
@@ -96,6 +92,40 @@ def _ensure_constraint(session, query: str, name: str) -> None:
         session.run(query)
     except DatabaseError as exc:
         print(f"Skipping constraint {name}: {exc}")
+
+
+def _drop_legacy_chat_graph_schema(session) -> None:
+    constraints = session.run("SHOW CONSTRAINTS YIELD name, labelsOrTypes")
+    for record in constraints:
+        labels = set(record.get("labelsOrTypes") or [])
+        if labels & {"Conversation", "Message"}:
+            session.run(f"DROP CONSTRAINT `{record['name']}` IF EXISTS")
+    indexes = session.run("SHOW INDEXES YIELD name, labelsOrTypes")
+    for record in indexes:
+        labels = set(record.get("labelsOrTypes") or [])
+        if labels & {"Conversation", "Message"}:
+            session.run(f"DROP INDEX `{record['name']}` IF EXISTS")
+
+
+def _cleanup_legacy_chat_graph(session) -> None:
+    session.run(
+        """
+        MATCH (n)
+        WHERE n:Conversation OR n:Message
+        DETACH DELETE n
+        """
+    )
+
+
+def _ensure_user_node(session, *, user_id: str) -> None:
+    session.run(
+        """
+        MERGE (u:User {id: $user_id})
+        ON CREATE SET u.created_at = datetime()
+        SET u.last_seen = datetime()
+        """,
+        user_id=user_id,
+    )
 
 
 def _deduplicate_user_nodes(session) -> None:
@@ -245,6 +275,8 @@ def _message_requests_web(message: str) -> bool:
     return any(phrase in lowered for phrase in web_phrases)
 
 
+
+
 @app.get("/")
 def root() -> dict[str, str]:
     return {"message": "GraphMind backend is running"}
@@ -265,6 +297,8 @@ def auth_register(req: AuthCredentials, response: Response) -> dict[str, object]
         user = register_user(username=req.username, password=req.password)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    with get_session() as session:
+        _ensure_user_node(session, user_id=user.user_id)
     token, _expires_at = create_session(user_id=user.user_id)
     _set_session_cookie(response, token)
     return _auth_payload(user)
@@ -278,6 +312,8 @@ def auth_login(req: AuthCredentials, response: Response) -> dict[str, object]:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid username or password.",
         )
+    with get_session() as session:
+        _ensure_user_node(session, user_id=user.user_id)
     token, _expires_at = create_session(user_id=user.user_id)
     _set_session_cookie(response, token)
     return _auth_payload(user)
@@ -402,6 +438,14 @@ def chat_ui() -> str:
       margin-right:8px;
       padding-right:8px;
       border-right:1px solid rgba(148,163,184,.12);
+    }
+    .authBar.signedIn .field,
+    .authBar.signedIn #loginBtn,
+    .authBar.signedIn #registerBtn{
+      display:none;
+    }
+    .authBar.signedOut #logoutBtn{
+      display:none;
     }
     .pill{
       border:1px solid rgba(148,163,184,.18);
@@ -606,6 +650,32 @@ def chat_ui() -> str:
     .panel h3{margin:0; font-size:14px; letter-spacing:.01em;}
     .panelHead{display:flex; align-items:center; justify-content:space-between; gap:8px;}
     .tiny{font-size:11px; color:var(--muted);}
+    .topMeta{display:flex; align-items:center; gap:8px; flex-wrap:wrap;}
+    .statusChip{
+      display:inline-flex;
+      align-items:center;
+      gap:8px;
+      padding:8px 12px;
+      border-radius:999px;
+      border:1px solid rgba(148,163,184,.14);
+      background:rgba(6,14,24,.72);
+      color:var(--muted);
+      font-size:12px;
+    }
+    .statusChip strong{color:var(--text); font-weight:600;}
+    .statusDot{
+      width:8px;
+      height:8px;
+      border-radius:999px;
+      background:#f59e0b;
+      box-shadow:0 0 0 6px rgba(245,158,11,.12);
+      flex:0 0 auto;
+    }
+    .statusChip.live .statusDot{
+      background:#34d399;
+      box-shadow:0 0 0 6px rgba(52,211,153,.12);
+    }
+    .hiddenMeta{display:none;}
     .list{display:flex; flex-direction:column; gap:10px; overflow:auto; min-height:0;}
     .item{
       padding:11px 12px;
@@ -618,8 +688,22 @@ def chat_ui() -> str:
     .tag{padding:3px 8px; border-radius:999px; background:var(--accent-soft); border:1px solid rgba(125,211,252,.24); font-size:11px;}
     .ok{color:var(--good)}
     .warn{color:var(--warn)}
-    .summary{display:flex; gap:8px; flex-wrap:wrap; align-content:flex-start; min-height:28px;}
-    .summary .tag{background:rgba(34,197,94,.1); border-color:rgba(34,197,94,.25);}
+    .summary{display:grid; gap:10px; min-height:28px;}
+    .summaryHero{
+      display:flex;
+      align-items:flex-start;
+      justify-content:space-between;
+      gap:10px;
+      padding:12px 14px;
+      border-radius:18px;
+      background:linear-gradient(135deg, rgba(125,211,252,.11), rgba(16,185,129,.07));
+      border:1px solid rgba(125,211,252,.16);
+    }
+    .summaryHero b{display:block; font-size:14px; margin-bottom:4px;}
+    .summaryHero span{font-size:12px; color:var(--muted); line-height:1.55;}
+    .summaryStats{display:flex; gap:8px; flex-wrap:wrap;}
+    .summaryStats .tag{background:rgba(34,197,94,.1); border-color:rgba(34,197,94,.25);}
+    .mutedTag{background:rgba(148,163,184,.08) !important; border-color:rgba(148,163,184,.16) !important; color:var(--muted);}
     .evidenceList{
       display:flex;
       flex-direction:column;
@@ -656,6 +740,7 @@ def chat_ui() -> str:
     .legendDot{display:inline-flex; align-items:center; gap:6px; font-size:11px; color:var(--muted);}
     .legendDot i{display:inline-block; width:10px; height:10px; border-radius:999px;}
     .graphEmpty{display:flex; align-items:center; justify-content:center; min-height:250px; color:var(--muted); font-size:12px;}
+    .graphHint{font-size:11px; color:var(--muted); padding-top:2px;}
     .graphModal{
       position:fixed;
       inset:0;
@@ -701,6 +786,80 @@ def chat_ui() -> str:
       position:relative;
     }
     .graphModalCanvas svg{width:100%; height:100%; display:block;}
+    .plannerModal{
+      position:fixed;
+      inset:0;
+      display:none;
+      align-items:center;
+      justify-content:center;
+      padding:20px;
+      background:rgba(2,8,16,.76);
+      backdrop-filter:blur(8px);
+      z-index:55;
+    }
+    .plannerModal.open{display:flex;}
+    .plannerModalCard{
+      width:min(920px, calc(100vw - 40px));
+      height:min(780px, calc(100vh - 40px));
+      border:1px solid rgba(148,163,184,.18);
+      border-radius:28px;
+      background:linear-gradient(180deg, rgba(10,21,33,.99), rgba(6,14,24,.99));
+      box-shadow:0 30px 80px rgba(1,8,20,.56);
+      display:grid;
+      grid-template-rows:auto auto minmax(0,1fr);
+      gap:14px;
+      padding:18px;
+    }
+    .plannerBar{display:flex; gap:10px; flex-wrap:wrap; align-items:center;}
+    .plannerInput{
+      border:1px solid rgba(148,163,184,.16);
+      background:rgba(5,14,23,.92);
+      color:var(--text);
+      border-radius:14px;
+      padding:10px 12px;
+      font:inherit;
+      min-width:150px;
+    }
+    .plannerBody{
+      display:grid;
+      grid-template-columns:1.05fr .95fr;
+      gap:14px;
+      min-height:0;
+    }
+    .plannerPanel{
+      min-height:0;
+      overflow:auto;
+      border:1px solid rgba(148,163,184,.12);
+      border-radius:20px;
+      background:linear-gradient(180deg, rgba(16,28,43,.94), rgba(8,16,27,.96));
+      padding:14px;
+      display:flex;
+      flex-direction:column;
+      gap:10px;
+    }
+    .plannerSectionTitle{font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.08em;}
+    .plannerBlock{
+      padding:12px;
+      border-radius:16px;
+      border:1px solid rgba(148,163,184,.12);
+      background:rgba(8,16,27,.78);
+    }
+    .plannerBlock b{display:block; margin-bottom:5px; font-size:13px;}
+    .plannerBlock ul{margin:6px 0 0 18px; padding:0;}
+    .plannerBlock li{margin:4px 0; color:var(--muted); font-size:12px; line-height:1.55;}
+    .plannerPlaceholder{color:var(--muted); font-size:12px; padding:18px 6px;}
+    .plannerStartRow{display:flex; gap:10px; align-items:center; justify-content:space-between; flex-wrap:wrap;}
+    .plannerProgressLine{display:flex; gap:8px; flex-wrap:wrap; align-items:center;}
+    .plannerDayCard{
+      padding:14px;
+      border-radius:18px;
+      border:1px solid rgba(125,211,252,.18);
+      background:linear-gradient(135deg, rgba(125,211,252,.09), rgba(16,185,129,.07));
+    }
+    .plannerDayCard b{display:block; margin-bottom:6px; font-size:15px;}
+    .plannerSummaryGrid{display:grid; gap:10px;}
+    .plannerActiveBtn{display:none;}
+    .plannerActiveBtn.show{display:inline-flex;}
     @media (max-width: 1240px){
       body{overflow:auto; height:auto;}
       .app{height:auto; min-height:calc(100vh - 32px);}
@@ -708,6 +867,7 @@ def chat_ui() -> str:
       .title{flex-direction:column; align-items:flex-start;}
       .title span{text-align:left;}
       .authBar{border-right:none; padding-right:0; margin-right:0;}
+      .topMeta{width:100%;}
     }
     @media (max-width: 980px){
       body{padding:12px; overflow:auto; height:auto;}
@@ -726,6 +886,8 @@ def chat_ui() -> str:
       .field{width:100% !important;}
       .authBar{width:100%;}
       .msg{max-width:92%;}
+      .summaryHero{flex-direction:column;}
+      .plannerBody{grid-template-columns:1fr;}
     }
   </style>
 </head>
@@ -734,25 +896,28 @@ def chat_ui() -> str:
     <div class="top">
       <div class="title">
         <b>GraphMind</b>
-        <span>Persistent chat on the left, live memory on the right. Your conversation stays scrollable and visible while graph context updates alongside it.</span>
       </div>
       <div class="controls">
-        <div class="authBar">
+        <div class="authBar signedOut" id="authBar">
           <input type="text" id="authUsername" class="field" placeholder="username" style="width:140px;">
           <input type="password" id="authPassword" class="field" placeholder="password" style="width:140px;">
           <button class="btn" id="loginBtn">Login</button>
           <button class="btn" id="registerBtn">Register</button>
           <button class="btn" id="logoutBtn">Logout</button>
         </div>
-        <span class="pill">User: <code id="uid"></code></span>
-        <span class="pill">Account: <code id="uname"></code></span>
-        <span class="pill">Conversation: <code id="cid"></code></span>
-        <span class="pill">Ephemeral: <code id="backendLabel"></code></span>
-        <span class="pill">LLM: <code id="llmLabel">unknown</code></span>
+        <div class="topMeta">
+          <span class="statusChip" id="workspaceStatus"><i class="statusDot"></i><strong id="uname"></strong><span id="authStatus">Checking session...</span></span>
+          <span class="statusChip"><strong>Model</strong><span id="llmDisplay">unknown</span></span>
+        </div>
+        <span class="hiddenMeta pill">User: <code id="uid"></code></span>
+        <span class="hiddenMeta pill">Conversation: <code id="cid"></code></span>
+        <span class="hiddenMeta pill">Ephemeral: <code id="backendLabel"></code></span>
+        <span class="hiddenMeta pill">LLM: <code id="llmLabel">unknown</code></span>
         <button class="btn" id="newChat">New chat</button>
+        <button class="btn" id="openPlannerBtn">Company planner</button>
+        <button class="btn plannerActiveBtn" id="activePlannerBtn">Open planner</button>
         <button class="btn" id="refreshMemory">Refresh memory</button>
         <button class="btn" id="resetMemory">Reset user memory</button>
-        <span class="authStatus" id="authStatus">Checking session...</span>
       </div>
     </div>
 
@@ -800,16 +965,17 @@ def chat_ui() -> str:
             <div class="panelHead">
               <h3>Memory Graph</h3>
               <div class="graphActions">
-                <span class="tiny">Live node-to-node structure</span>
+                <span class="tiny">Relationship view</span>
                 <button class="iconBtn" id="maximizeGraph" type="button">Maximize</button>
               </div>
             </div>
+            <div class="graphHint">Core entities only. Lower-signal metadata stays out of the graph view.</div>
             <div class="graphLegend">
               <span class="legendDot"><i style="background:#f59e0b"></i>User</span>
-              <span class="legendDot"><i style="background:#38bdf8"></i>Topic</span>
               <span class="legendDot"><i style="background:#22c55e"></i>Skill</span>
-              <span class="legendDot"><i style="background:#fb7185"></i>Goal</span>
+              <span class="legendDot"><i style="background:#38bdf8"></i>Topic</span>
               <span class="legendDot"><i style="background:#a78bfa"></i>Company</span>
+              <span class="legendDot"><i style="background:#fb7185"></i>Goal</span>
             </div>
             <div class="graphCanvas" id="graphCanvas">
               <div class="graphEmpty">No graph nodes yet.</div>
@@ -829,6 +995,13 @@ def chat_ui() -> str:
             </div>
             <div class="list" id="graphList"></div>
           </div>
+          <div class="panel">
+            <div class="panelHead">
+              <h3>Cached Profile</h3>
+              <span class="tiny">Strengths, weaknesses, improving</span>
+            </div>
+            <div class="list" id="profileList"></div>
+          </div>
         </div>
       </div>
     </div>
@@ -839,7 +1012,7 @@ def chat_ui() -> str:
       <div class="graphModalHead">
         <div class="graphModalTitle">
           <b id="graphModalTitle">Memory Graph</b>
-          <span class="tiny">Expanded view of your current graph memory.</span>
+          <span class="tiny">Expanded relationship view of your strongest saved memory.</span>
         </div>
         <button class="iconBtn" id="closeGraphModal" type="button">Close</button>
       </div>
@@ -856,6 +1029,32 @@ def chat_ui() -> str:
     </div>
   </div>
 
+  <div class="plannerModal" id="plannerModal" aria-hidden="true">
+    <div class="plannerModalCard" role="dialog" aria-modal="true" aria-labelledby="plannerModalTitle">
+      <div class="graphModalHead">
+        <div class="graphModalTitle">
+          <b id="plannerModalTitle">Company Planner</b>
+          <span class="tiny">Generate a company-wise placement plan using Gemini and live web research.</span>
+        </div>
+        <button class="iconBtn" id="closePlannerModal" type="button">Close</button>
+      </div>
+      <div class="plannerBar">
+        <input class="plannerInput" id="plannerCompanyInput" type="text" placeholder="Company name">
+        <input class="plannerInput" id="plannerDaysInput" type="number" min="1" max="60" value="14" placeholder="Days">
+        <button class="btn" id="generatePlannerBtn" type="button">Generate plan</button>
+        <span class="tiny" id="plannerState">Enter a company and number of days.</span>
+      </div>
+      <div class="plannerBody">
+        <div class="plannerPanel" id="plannerMainPanel">
+          <div class="plannerPlaceholder">Planner overview, stages, and day-by-day schedule will appear here.</div>
+        </div>
+        <div class="plannerPanel" id="plannerSourcePanel">
+          <div class="plannerPlaceholder">Web findings and likely previous-question patterns will appear here.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
 <script>
 (() => {
   const msgs = document.getElementById('msgs');
@@ -867,18 +1066,32 @@ def chat_ui() -> str:
   const cidEl = document.getElementById('cid');
   const backendLabel = document.getElementById('backendLabel');
   const llmLabel = document.getElementById('llmLabel');
+  const llmDisplay = document.getElementById('llmDisplay');
+  const workspaceStatus = document.getElementById('workspaceStatus');
   const graphCanvas = document.getElementById('graphCanvas');
   const graphModal = document.getElementById('graphModal');
   const graphModalCanvas = document.getElementById('graphModalCanvas');
   const maximizeGraphBtn = document.getElementById('maximizeGraph');
   const closeGraphModalBtn = document.getElementById('closeGraphModal');
+  const openPlannerBtn = document.getElementById('openPlannerBtn');
+  const activePlannerBtn = document.getElementById('activePlannerBtn');
+  const plannerModal = document.getElementById('plannerModal');
+  const closePlannerModalBtn = document.getElementById('closePlannerModal');
+  const plannerCompanyInput = document.getElementById('plannerCompanyInput');
+  const plannerDaysInput = document.getElementById('plannerDaysInput');
+  const generatePlannerBtn = document.getElementById('generatePlannerBtn');
+  const plannerMainPanel = document.getElementById('plannerMainPanel');
+  const plannerSourcePanel = document.getElementById('plannerSourcePanel');
+  const plannerState = document.getElementById('plannerState');
   const ephemeralList = document.getElementById('ephemeralList');
   const graphList = document.getElementById('graphList');
+  const profileList = document.getElementById('profileList');
   const evidenceList = document.getElementById('evidenceList');
   const summary = document.getElementById('summary');
   const memoryUpdated = document.getElementById('memoryUpdated');
   const unameEl = document.getElementById('uname');
   const authStatusEl = document.getElementById('authStatus');
+  const authBar = document.getElementById('authBar');
   const authUsername = document.getElementById('authUsername');
   const authPassword = document.getElementById('authPassword');
   const loginBtn = document.getElementById('loginBtn');
@@ -892,6 +1105,8 @@ def chat_ui() -> str:
   let username = '';
   let latestGraphNodes = [];
   let latestGraphEdges = [];
+  let latestPlannerPayload = null;
+  let activePlannerSession = null;
   let convoId = localStorage.getItem('graphmind_convo_id');
   if (!convoId) { convoId = "convo-" + rand(); localStorage.setItem('graphmind_convo_id', convoId); }
 
@@ -904,18 +1119,32 @@ def chat_ui() -> str:
     userId = user?.user_id || '';
     username = user?.username || '';
     uidEl.textContent = userId || 'guest';
-    unameEl.textContent = username || 'guest';
-    authStatusEl.textContent = userId ? ('Signed in as ' + username) : 'Not signed in';
+    unameEl.textContent = username || 'Guest';
+    authStatusEl.textContent = userId ? 'Private workspace active' : 'Sign in to use saved memory';
+    workspaceStatus.classList.toggle('live', !!userId);
+    authBar.classList.toggle('signedIn', !!userId);
+    authBar.classList.toggle('signedOut', !userId);
     input.disabled = !userId;
     sendBtn.disabled = !userId;
     logoutBtn.disabled = !userId;
     document.getElementById('newChat').disabled = !userId;
+    openPlannerBtn.disabled = !userId;
+    activePlannerBtn.disabled = !userId;
     document.getElementById('refreshMemory').disabled = !userId;
     document.getElementById('resetMemory').disabled = !userId;
+    if (!userId) {
+      activePlannerSession = null;
+      latestPlannerPayload = null;
+      renderActivePlannerButton();
+    } else {
+      activePlannerSession = loadPlannerSession();
+      renderActivePlannerButton();
+    }
     if (!userId) {
       conversationList.innerHTML = '<div class="item tiny">Sign in to see saved chats.</div>';
       renderEmpty(ephemeralList, 'Sign in to load this user memory space.');
       renderEmpty(graphList, 'Sign in to load this user memory space.');
+      renderEmpty(profileList, 'Sign in to load your cached profile.');
       renderEmpty(evidenceList, 'Sign in to see evidence paths.');
       graphCanvas.innerHTML = '<div class="graphEmpty">Sign in to view your graph.</div>';
       graphModalCanvas.innerHTML = '<div class="graphEmpty">Sign in to view your graph.</div>';
@@ -930,6 +1159,8 @@ def chat_ui() -> str:
       if (data?.authenticated) {
         await loadConversationList();
         await loadChatHistory();
+        activePlannerSession = loadPlannerSession();
+        renderActivePlannerButton();
         await refreshMemory();
         input.focus();
       }
@@ -984,6 +1215,8 @@ def chat_ui() -> str:
       }
       authStatusEl.textContent = 'Signed in as ' + data.user.username;
       authPassword.value = '';
+      activePlannerSession = loadPlannerSession();
+      renderActivePlannerButton();
       await refreshMemory();
       await loadConversationList();
       input.focus();
@@ -996,6 +1229,278 @@ def chat_ui() -> str:
 
   function renderEmpty(target, text) {
     target.innerHTML = '<div class="item tiny">' + text + '</div>';
+  }
+
+  function plannerStorageKey() {
+    return 'graphmind_planner_' + (userId || 'guest');
+  }
+
+  function loadPlannerSession() {
+    if (!userId) return null;
+    try {
+      const raw = localStorage.getItem(plannerStorageKey());
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch (e) {
+      console.error(e);
+      return null;
+    }
+  }
+
+  function savePlannerSession(session) {
+    if (!userId) return;
+    activePlannerSession = session;
+    localStorage.setItem(plannerStorageKey(), JSON.stringify(session));
+    renderActivePlannerButton();
+  }
+
+  function clearPlannerSession() {
+    if (userId) localStorage.removeItem(plannerStorageKey());
+    activePlannerSession = null;
+    renderActivePlannerButton();
+  }
+
+  function renderActivePlannerButton() {
+    const company = activePlannerSession?.company || '';
+    activePlannerBtn.classList.toggle('show', !!company);
+    activePlannerBtn.textContent = company || 'Open planner';
+  }
+
+  function plannerFlowSummary(daily) {
+    const items = Array.isArray(daily) ? daily : [];
+    if (!items.length) return [];
+    const checkpoints = [0, Math.floor(items.length / 3), Math.floor((items.length * 2) / 3), items.length - 1];
+    return [...new Set(checkpoints)]
+      .filter((index) => index >= 0 && index < items.length)
+      .map((index) => ({
+        label: `Day ${index}`,
+        title: items[index]?.title || 'Preparation block',
+        goal: items[index]?.goal || ''
+      }));
+  }
+
+  function renderPlannerStartView(data) {
+    const planner = data?.planner || {};
+    const stages = Array.isArray(planner.stages) ? planner.stages : [];
+    const summaryItems = plannerFlowSummary(planner.daily_plan || []);
+    plannerMainPanel.innerHTML = `
+      <div class="plannerBlock">
+        <b>${planner.company || data.company}</b>
+        <div class="tiny">${planner.overview || 'Planner generated from web-backed company research.'}</div>
+      </div>
+      <div class="plannerSectionTitle">14-Day Flow</div>
+      <div class="plannerSummaryGrid">
+        ${summaryItems.map((item) => `
+          <div class="plannerBlock">
+            <b>${item.label}</b>
+            <div class="tiny">${item.title}</div>
+            <div class="tiny" style="margin-top:6px;">${item.goal}</div>
+          </div>
+        `).join('')}
+      </div>
+      <div class="plannerSectionTitle">Stages</div>
+      ${stages.map((stage) => `
+        <div class="plannerBlock">
+          <b>${stage.name}</b>
+          <div class="tiny">${stage.focus || ''}</div>
+        </div>
+      `).join('')}
+      <div class="plannerStartRow">
+        <span class="tiny">Start the guided flow to unlock Day 0.</span>
+        <button class="btn" id="startPlannerFlowBtn" type="button">Start</button>
+      </div>
+    `;
+    const startPlannerFlowBtn = document.getElementById('startPlannerFlowBtn');
+    if (startPlannerFlowBtn) {
+      startPlannerFlowBtn.addEventListener('click', () => {
+        const session = {
+          company: planner.company || data.company,
+          daysLeft: Number(data.days_left || (planner.daily_plan || []).length || 14),
+          planner,
+          sources: data.sources || [],
+          currentDay: 0,
+          started: true,
+        };
+        savePlannerSession(session);
+        renderPlannerProgressView(session);
+        plannerState.textContent = 'Planner started. Day 0 is ready.';
+      });
+    }
+  }
+
+  function renderPlannerProgressView(session) {
+    const planner = session?.planner || {};
+    const daily = Array.isArray(planner.daily_plan) ? planner.daily_plan : [];
+    const currentDay = Math.max(0, Number(session?.currentDay || 0));
+    const current = daily[currentDay];
+    if (!current) {
+      plannerMainPanel.innerHTML = `
+        <div class="plannerBlock">
+          <b>${planner.company || session?.company || 'Planner complete'}</b>
+          <div class="tiny">All guided days are complete.</div>
+        </div>
+        <div class="plannerStartRow">
+          <span class="tiny">You can restart this company flow anytime.</span>
+          <button class="btn" id="restartPlannerBtn" type="button">Restart</button>
+        </div>
+      `;
+      const restartPlannerBtn = document.getElementById('restartPlannerBtn');
+      if (restartPlannerBtn) {
+        restartPlannerBtn.addEventListener('click', () => {
+          const nextSession = { ...session, currentDay: 0 };
+          savePlannerSession(nextSession);
+          renderPlannerProgressView(nextSession);
+        });
+      }
+      return;
+    }
+    plannerMainPanel.innerHTML = `
+      <div class="plannerBlock">
+        <b>${planner.company || session.company}</b>
+        <div class="plannerProgressLine">
+          <span class="tag">Current Day ${currentDay}</span>
+          <span class="tag">${Math.min(currentDay, daily.length)}/${daily.length} done</span>
+        </div>
+      </div>
+      <div class="plannerDayCard">
+        <b>Day ${currentDay}: ${current.title}</b>
+        <ul>${Array.isArray(current.tasks) ? current.tasks.map((task) => `<li>${task}</li>`).join('') : ''}</ul>
+        <div class="tiny" style="margin-top:8px;">${current.goal || ''}</div>
+      </div>
+      <div class="plannerStartRow">
+        <span class="tiny">Complete this day to unlock the next one.</span>
+        <div class="plannerProgressLine">
+          <button class="btn" id="plannerDoneBtn" type="button">Done</button>
+          <button class="btn" id="plannerResetBtn" type="button">Reset</button>
+        </div>
+      </div>
+    `;
+    const plannerDoneBtn = document.getElementById('plannerDoneBtn');
+    const plannerResetBtn = document.getElementById('plannerResetBtn');
+    if (plannerDoneBtn) {
+      plannerDoneBtn.addEventListener('click', () => {
+        const nextSession = { ...session, currentDay: currentDay + 1 };
+        savePlannerSession(nextSession);
+        renderPlannerProgressView(nextSession);
+        plannerState.textContent = nextSession.currentDay >= daily.length ? 'Planner complete.' : `Moved to Day ${nextSession.currentDay}.`;
+      });
+    }
+    if (plannerResetBtn) {
+      plannerResetBtn.addEventListener('click', () => {
+        const nextSession = { ...session, currentDay: 0 };
+        savePlannerSession(nextSession);
+        renderPlannerProgressView(nextSession);
+        plannerState.textContent = 'Planner reset to Day 0.';
+      });
+    }
+  }
+
+  function renderPlannerResult(data) {
+    const planner = data?.planner || {};
+    const recommendations = Array.isArray(planner.recommendations) ? planner.recommendations : [];
+    const patterns = Array.isArray(planner.likely_previous_question_patterns) ? planner.likely_previous_question_patterns : [];
+    const webTopics = Array.isArray(planner.web_focus_topics) ? planner.web_focus_topics : [];
+    const focusMap = planner.personalized_focus || {};
+    const strengths = Array.isArray(focusMap.strengths_to_use) ? focusMap.strengths_to_use : [];
+    const weaknesses = Array.isArray(focusMap.weaknesses_to_focus) ? focusMap.weaknesses_to_focus : [];
+    const improving = Array.isArray(focusMap.improving_now) ? focusMap.improving_now : [];
+    const fitAnalysis = planner.fit_analysis || {};
+    const matchedStrengths = Array.isArray(fitAnalysis.matched_strengths) ? fitAnalysis.matched_strengths : [];
+    const matchedWeaknesses = Array.isArray(fitAnalysis.matched_weaknesses) ? fitAnalysis.matched_weaknesses : [];
+    const strategicSummary = fitAnalysis.strategic_summary || '';
+    const sources = Array.isArray(data?.sources) ? data.sources : [];
+    const renderPlannerList = (items, emptyText) => {
+      if (!Array.isArray(items) || !items.length) {
+        return `<div class="tiny">${escapeXml(emptyText)}</div>`;
+      }
+      return `<ul>${items.map((item) => `<li>${escapeXml(String(item || ''))}</li>`).join('')}</ul>`;
+    };
+    latestPlannerPayload = data;
+    renderPlannerStartView(data);
+
+    plannerSourcePanel.innerHTML = `
+      <div class="plannerSectionTitle">Topics Asked From Web</div>
+      <div class="plannerBlock">
+        ${renderPlannerList(webTopics, 'No strong web topics were extracted.')}
+      </div>
+      <div class="plannerSectionTitle">Personalized Focus Map</div>
+      <div class="plannerBlock">
+        <b>Analysis</b>
+        <div class="tiny">${escapeXml(strategicSummary || 'No personalized analysis available yet.')}</div>
+      </div>
+      <div class="plannerBlock">
+        <b>Strengths that match company topics</b>
+        ${renderPlannerList(matchedStrengths, 'No strong cached overlap found yet.')}
+      </div>
+      <div class="plannerBlock">
+        <b>Weaknesses that need focus first</b>
+        ${renderPlannerList(matchedWeaknesses, 'No weak-topic overlap detected yet.')}
+      </div>
+      <div class="plannerBlock">
+        <b>Full cached profile snapshot</b>
+        ${renderPlannerList([
+          ...strengths.map((item) => `Strength: ${item}`),
+          ...weaknesses.map((item) => `Weakness: ${item}`),
+          ...improving.map((item) => `Improving: ${item}`)
+        ], 'No cached profile signals yet. Chat more about your strengths and weak areas first.')}
+      </div>
+      <div class="plannerBlock">
+        <b>Currently improving</b>
+        ${renderPlannerList(improving, 'No active improving signals yet.')}
+      </div>
+      <div class="plannerSectionTitle">Recommendations</div>
+      <div class="plannerBlock">
+        ${renderPlannerList(recommendations, 'No recommendations returned.')}
+      </div>
+      <div class="plannerSectionTitle">Previous Question Patterns</div>
+      <div class="plannerBlock">
+        ${renderPlannerList(patterns, 'No repeated question patterns detected.')}
+      </div>
+      <div class="plannerSectionTitle">Web Sources</div>
+      ${sources.length ? sources.map((item) => `
+        <div class="plannerBlock">
+          <b>${item.title || 'Source'}</b>
+          <div class="tiny">${item.snippet || ''}</div>
+          <div class="tiny" style="margin-top:6px;"><a href="${escapeXml(item.url || '#')}" target="_blank" rel="noopener noreferrer">${item.url || ''}</a></div>
+        </div>
+      `).join('') : '<div class="plannerPlaceholder">No web sources returned.</div>'}
+    `;
+  }
+
+  async function generatePlanner() {
+    const company = (plannerCompanyInput.value || '').trim();
+    const parsedDays = parseInt(String(plannerDaysInput.value || '').trim(), 10);
+    const daysLeft = Number.isFinite(parsedDays) && parsedDays > 0 ? parsedDays : 14;
+    if (!company || !daysLeft) {
+      plannerState.textContent = 'Enter both company and days.';
+      return;
+    }
+    plannerDaysInput.value = String(daysLeft);
+    plannerState.textContent = 'Researching company rounds and generating plan...';
+    generatePlannerBtn.disabled = true;
+    try {
+      const res = await fetch('/planner/company', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          company,
+          days_left: daysLeft
+        })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.detail || 'Unable to generate planner.');
+      }
+      clearPlannerSession();
+      renderPlannerResult(data);
+      plannerState.textContent = 'Planner ready.';
+    } catch (e) {
+      console.error(e);
+      plannerState.textContent = e.message || 'Unable to generate planner.';
+    } finally {
+      generatePlannerBtn.disabled = false;
+    }
   }
 
   function formatConversationPreview(item) {
@@ -1045,17 +1550,17 @@ def chat_ui() -> str:
   function renderEphemeral(items, backend) {
     backendLabel.textContent = backend || 'unknown';
     if (!items || !items.length) {
-      renderEmpty(ephemeralList, 'No ephemeral signals yet.');
+      renderEmpty(ephemeralList, 'No active short-term signals.');
       return;
     }
-    ephemeralList.innerHTML = items.map((item) => `
+    ephemeralList.innerHTML = items.slice(0, 5).map((item) => `
       <div class="item">
-        <b>${item.relation} -> ${item.entity}</b>
+        <b>${item.entity}</b>
         <div class="row">
+          <span class="tag">${item.relation.replaceAll('_', ' ')}</span>
           <span class="tag">${item.entity_type}</span>
-          <span>confidence ${Number(item.max_confidence || 0).toFixed(2)}</span>
-          <span>mentions ${item.mention_count || 0}</span>
-          <span class="${item.promoted ? 'ok' : 'warn'}">${item.promoted ? 'promoted' : 'pending'}</span>
+          <span>${item.mention_count || 0} mentions</span>
+          <span class="${item.promoted ? 'ok' : 'warn'}">${item.promoted ? 'promoted' : 'warming up'}</span>
         </div>
       </div>
     `).join('');
@@ -1066,16 +1571,42 @@ def chat_ui() -> str:
       renderEmpty(graphList, 'No graph memory yet.');
       return;
     }
-    graphList.innerHTML = items.map((item) => `
+    graphList.innerHTML = items.slice(0, 6).map((item) => `
       <div class="item">
-        <b>${item.relation} -> ${item.entity}</b>
+        <b>${item.entity}</b>
         <div class="row">
+          <span class="tag">${item.relation.replaceAll('_', ' ')}</span>
           <span class="tag">${item.entity_type}</span>
-          <span>confidence ${Number(item.confidence || 0).toFixed(2)}</span>
-          <span>reinforcements ${item.reinforcement_count || 0}</span>
-          <span>related ${item.related_count || 0}</span>
+          <span>${item.reinforcement_count || 0} reinforcements</span>
+          <span>${item.related_count || 0} linked</span>
         </div>
         ${(item.aliases && item.aliases.length > 1) ? `<div class="tiny">aliases: ${item.aliases.join(', ')}</div>` : ''}
+      </div>
+    `).join('');
+  }
+
+  function renderProfile(profile) {
+    const strengths = Array.isArray(profile?.strengths) ? profile.strengths : [];
+    const weaknesses = Array.isArray(profile?.weaknesses) ? profile.weaknesses : [];
+    const improving = Array.isArray(profile?.improving) ? profile.improving : [];
+    const rows = [
+      ...strengths.map((item) => ({ label: 'Strength', tone: 'ok', item })),
+      ...weaknesses.map((item) => ({ label: 'Weakness', tone: 'warn', item })),
+      ...improving.map((item) => ({ label: 'Improving', tone: '', item })),
+    ];
+    if (!rows.length) {
+      renderEmpty(profileList, 'No cached profile signals yet.');
+      return;
+    }
+    profileList.innerHTML = rows.slice(0, 9).map(({ label, tone, item }) => `
+      <div class="item">
+        <b>${escapeXml(item.entity || 'Unknown')}</b>
+        <div class="row">
+          <span class="tag ${tone}">${label}</span>
+          <span class="tag">${escapeXml(item.entity_type || 'Skill')}</span>
+          <span>score ${Number(item.score || 0).toFixed(2)}</span>
+          <span>${Number(item.evidence_count || 0)} signals</span>
+        </div>
       </div>
     `).join('');
   }
@@ -1087,18 +1618,33 @@ def chat_ui() -> str:
     const graphFacts = data?.graph_evidence?.facts?.length ?? 0;
     const route = data?.route?.intent || 'unknown';
     const topic = data?.topic_match?.topic || '';
-    const sections = (data?.section_plan?.sections || []).join('+');
-    llmLabel.textContent = data?.llm_provider || 'unknown';
+    const provider = data?.llm_provider || 'unknown';
+    llmLabel.textContent = provider;
+    llmDisplay.textContent = provider;
+    const headline = promoted > 0
+      ? `Memory updated with ${promoted} promoted item${promoted === 1 ? '' : 's'}.`
+      : signals > 0
+        ? `Signals detected and kept ready for reinforcement.`
+        : `No major memory change from this turn.`;
+    const supporting = graphFacts > 0
+      ? `Answer grounded with ${graphFacts} graph fact${graphFacts === 1 ? '' : 's'} and ${retrieved} retrieved snippet${retrieved === 1 ? '' : 's'}.`
+      : `Route: ${route.replaceAll('_', ' ')}.` + (topic ? ` Focus: ${topic}.` : '');
     const tags = [
-      `<span class="tag">route ${route}</span>`,
       `<span class="tag">signals ${signals}</span>`,
       `<span class="tag">promoted ${promoted}</span>`,
       `<span class="tag">retrieved ${retrieved}</span>`,
-      `<span class="tag">graph facts ${graphFacts}</span>`
+      `<span class="tag mutedTag">${route.replaceAll('_', ' ')}</span>`
     ];
-    if (topic) tags.splice(1, 0, `<span class="tag">topic ${topic}</span>`);
-    if (sections) tags.splice(1, 0, `<span class="tag">sections ${sections}</span>`);
-    summary.innerHTML = tags.join('');
+    if (topic) tags.unshift(`<span class="tag">${topic}</span>`);
+    summary.innerHTML = `
+      <div class="summaryHero">
+        <div>
+          <b>${headline}</b>
+          <span>${supporting}</span>
+        </div>
+        <div class="summaryStats">${tags.join('')}</div>
+      </div>
+    `;
     memoryUpdated.textContent = 'Updated just now';
   }
 
@@ -1350,13 +1896,11 @@ def chat_ui() -> str:
       const color = colorForType(node.type);
       const radius = Math.max(12, Number(node.size || 16));
       const labelY = pos.y + radius + 16;
-      const typeY = labelY + 12;
       return `
         <g>
           <circle cx="${pos.x.toFixed(1)}" cy="${pos.y.toFixed(1)}" r="${radius}" fill="${color}" fill-opacity="0.18" stroke="${color}" stroke-width="2" />
           <circle cx="${pos.x.toFixed(1)}" cy="${pos.y.toFixed(1)}" r="${Math.max(4, radius / 3)}" fill="${color}" />
           <text x="${pos.x.toFixed(1)}" y="${labelY.toFixed(1)}" fill="#e5e7eb" font-size="11" text-anchor="middle">${escapeXml(node.label)}</text>
-          ${node.type !== 'User' ? `<text x="${pos.x.toFixed(1)}" y="${typeY.toFixed(1)}" fill="rgba(148,163,184,.92)" font-size="9" text-anchor="middle">${escapeXml(node.type)}</text>` : ''}
         </g>
       `;
     }).join('');
@@ -1399,19 +1943,22 @@ def chat_ui() -> str:
       return;
     }
     try {
-      const [ephemeralRes, graphRes, graphViewRes] = await Promise.all([
+      const [ephemeralRes, graphRes, graphViewRes, profileRes] = await Promise.all([
         fetch('/memory/ephemeral/' + userId),
         fetch('/graph/memory/' + userId),
-        fetch('/graph/view/' + userId)
+        fetch('/graph/view/' + userId),
+        fetch('/profile/summary/' + userId)
       ]);
-      if (!ephemeralRes.ok || !graphRes.ok || !graphViewRes.ok) {
+      if (!ephemeralRes.ok || !graphRes.ok || !graphViewRes.ok || !profileRes.ok) {
         throw new Error('Unable to refresh memory for this session.');
       }
       const ephemeralData = await ephemeralRes.json();
       const graphData = await graphRes.json();
       const graphViewData = await graphViewRes.json();
+      const profileData = await profileRes.json();
       renderEphemeral(ephemeralData.items || [], ephemeralData.backend);
       renderGraph(graphData.items || []);
+      renderProfile(profileData.profile || {});
       latestGraphNodes = graphViewData.nodes || [];
       latestGraphEdges = graphViewData.edges || [];
       renderGraphView(graphCanvas, latestGraphNodes, latestGraphEdges);
@@ -1575,6 +2122,51 @@ def chat_ui() -> str:
   });
 
   document.getElementById('refreshMemory').addEventListener('click', refreshMemory);
+  openPlannerBtn.addEventListener('click', () => {
+    plannerModal.classList.add('open');
+    plannerModal.setAttribute('aria-hidden', 'false');
+    if (activePlannerSession) {
+      renderPlannerProgressView(activePlannerSession);
+      plannerCompanyInput.value = activePlannerSession.company || '';
+      plannerDaysInput.value = String(activePlannerSession.daysLeft || 14);
+      plannerState.textContent = `Active planner: ${activePlannerSession.company}`;
+    } else if (latestPlannerPayload) {
+      renderPlannerStartView(latestPlannerPayload);
+    }
+    plannerCompanyInput.focus();
+  });
+  activePlannerBtn.addEventListener('click', () => {
+    if (!activePlannerSession) return;
+    plannerModal.classList.add('open');
+    plannerModal.setAttribute('aria-hidden', 'false');
+    renderPlannerProgressView(activePlannerSession);
+    plannerCompanyInput.value = activePlannerSession.company || '';
+    plannerDaysInput.value = String(activePlannerSession.daysLeft || 14);
+    plannerState.textContent = `Active planner: ${activePlannerSession.company}`;
+  });
+  closePlannerModalBtn.addEventListener('click', () => {
+    plannerModal.classList.remove('open');
+    plannerModal.setAttribute('aria-hidden', 'true');
+  });
+  plannerModal.addEventListener('click', (event) => {
+    if (event.target === plannerModal) {
+      plannerModal.classList.remove('open');
+      plannerModal.setAttribute('aria-hidden', 'true');
+    }
+  });
+  generatePlannerBtn.addEventListener('click', generatePlanner);
+  plannerCompanyInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      generatePlanner();
+    }
+  });
+  plannerDaysInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      generatePlanner();
+    }
+  });
   maximizeGraphBtn.addEventListener('click', () => {
     renderGraphView(graphModalCanvas, latestGraphNodes, latestGraphEdges, { width: 1100, height: 760 });
     graphModal.classList.add('open');
@@ -1594,6 +2186,10 @@ def chat_ui() -> str:
     if (event.key === 'Escape' && graphModal.classList.contains('open')) {
       graphModal.classList.remove('open');
       graphModal.setAttribute('aria-hidden', 'true');
+    }
+    if (event.key === 'Escape' && plannerModal.classList.contains('open')) {
+      plannerModal.classList.remove('open');
+      plannerModal.setAttribute('aria-hidden', 'true');
     }
   });
   document.getElementById('resetMemory').addEventListener('click', async () => {
@@ -1642,42 +2238,6 @@ def chat_ui() -> str:
 </body>
 </html>
 """
-
-
-def _neo4j_save_message(
-    *,
-    session,
-    user_id: str,
-    conversation_id: str,
-    role: str,
-    text: str,
-) -> str:
-    msg_id = str(uuid4())
-    session.run(
-        """
-        MERGE (u:User {id: $user_id})
-        SET u.last_seen = datetime()
-        MERGE (c:Conversation {id: $conversation_id})
-        ON CREATE SET c.created_at = datetime()
-        MERGE (u)-[:HAS_CONVERSATION]->(c)
-        CREATE (m:Message {
-            id: $msg_id,
-            user_id: $user_id,
-            conversation_id: $conversation_id,
-            role: $role,
-            text: $text,
-            created_at: datetime()
-        })
-        MERGE (c)-[:HAS_MESSAGE]->(m)
-        """,
-        user_id=user_id,
-        conversation_id=conversation_id,
-        msg_id=msg_id,
-        role=role,
-        text=text,
-    )
-    return msg_id
-
 
 def _compress_snippet(text: str, limit: int = 180) -> str:
     cleaned = " ".join((text or "").split())
@@ -1757,6 +2317,97 @@ def _fetch_web_bundle(*, queries: list[str], intent: str, reason: str) -> tuple[
     return items, int((time.time() - start) * 1000)
 
 
+def _planner_queries(company: str) -> list[str]:
+    cleaned = " ".join((company or "").split()).strip()
+    return [
+        f"{cleaned} recruitment process rounds",
+        f"{cleaned} previous interview questions",
+        f"{cleaned} aptitude technical hr questions",
+        f"{cleaned} placement preparation topics",
+        f"{cleaned} role interview experience",
+    ]
+
+
+def _planner_memory_context(*, user_id: str) -> list[str]:
+    with get_session() as session:
+        records = graph_memory_service.fetch_graph_memory(user_id=user_id, session=session, limit=8)
+    lines: list[str] = []
+    for item in records:
+        entity = str(item.get("entity") or "").strip()
+        relation = str(item.get("relation") or "").strip()
+        entity_type = str(item.get("entity_type") or "").strip()
+        if entity and relation:
+            lines.append(f"{relation} -> {entity} ({entity_type})")
+    profile = fetch_profile_summary(user_id=user_id, limit=4)
+    for item in list(profile.get("strengths") or [])[:3]:
+        lines.append(f"STRENGTH_PROFILE -> {item['entity']} ({item['entity_type']}, score {float(item['score']):.2f})")
+    for item in list(profile.get("weaknesses") or [])[:3]:
+        lines.append(f"WEAKNESS_PROFILE -> {item['entity']} ({item['entity_type']}, score {float(item['score']):.2f})")
+    for item in list(profile.get("improving") or [])[:2]:
+        lines.append(f"IMPROVING_PROFILE -> {item['entity']} ({item['entity_type']}, improving {float(item['improving_score']):.2f})")
+    return lines
+
+
+def _profile_signal_queries(
+    *,
+    message: str,
+    observations: list[dict[str, object]],
+    triples,
+) -> list[str]:
+    lowered = f" {' '.join((message or '').lower().split())} "
+    if " i " not in lowered and " my " not in lowered and " me " not in lowered:
+        return []
+    entities: list[str] = []
+    for item in list(observations or [])[:5]:
+        entity = " ".join(str(item.get("entity") or "").split()).strip()
+        if entity:
+            entities.append(entity)
+    if not entities:
+        for triple in list(triples or [])[:8]:
+            if getattr(triple, "subject_type", "").strip().lower() != "user":
+                continue
+            entity = " ".join(str(getattr(triple, "object_name", "") or "").split()).strip()
+            if entity:
+                entities.append(entity)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for entity in entities:
+        key = entity.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(entity)
+    queries: list[str] = []
+    for entity in deduped[:3]:
+        queries.append(f"{entity} interview preparation important topics")
+        queries.append(f"{entity} common interview questions concepts")
+    return queries[:4]
+
+
+def _profile_signal_web_facts(
+    *,
+    message: str,
+    observations: list[dict[str, object]],
+    triples,
+) -> list[str]:
+    queries = _profile_signal_queries(message=message, observations=observations, triples=triples)
+    if not queries:
+        return []
+    plan = SearchPlan(
+        should_search=True,
+        intent="general_learning",
+        confidence=0.78,
+        entities={},
+        queries=queries,
+        reason="profile signal extraction context",
+    )
+    return [
+        f"{result.title}: {result.snippet} ({result.url})"
+        for result in search_from_plan(plan, limit=4)
+        if result.title
+    ]
+
+
 def _process_memory_pipeline(
     *,
     user_id: str,
@@ -1772,6 +2423,27 @@ def _process_memory_pipeline(
         message=message,
         source=source,
     )
+    base_profile_observations = analyze_strength_weakness_profile(
+        message=message,
+        triples=extracted_triples,
+    )
+    profile_web_facts = _profile_signal_web_facts(
+        message=message,
+        observations=base_profile_observations,
+        triples=extracted_triples,
+    )
+    profile_observations = analyze_strength_weakness_profile(
+        message=message,
+        triples=extracted_triples,
+        web_facts=profile_web_facts,
+        seed_observations=base_profile_observations,
+    ) or base_profile_observations
+    if profile_observations:
+        upsert_profile_observations(
+            user_id=user_id,
+            observations=profile_observations,
+        )
+    profile_summary = fetch_profile_summary(user_id=user_id, limit=5)
     extracted_raw_signals = [
         {
             "user_id": triple.user_id,
@@ -1841,6 +2513,8 @@ def _process_memory_pipeline(
     return {
         "signals_extracted": len(extracted_raw_signals),
         "promotion_summary": promotion_summary,
+        "profile_summary": profile_summary,
+        "profile_web_facts": profile_web_facts,
     }
 
 
@@ -1883,6 +2557,18 @@ def get_ephemeral_memory(
     }
 
 
+@app.get("/profile/summary/{user_id}")
+def get_profile_summary(
+    user_id: str,
+    graphmind_session: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME),
+) -> dict[str, object]:
+    resolved_user_id = _resolve_user_id(user_id, get_user_by_session_token(graphmind_session))
+    return {
+        "user_id": resolved_user_id,
+        "profile": fetch_profile_summary(user_id=resolved_user_id, limit=8),
+    }
+
+
 @app.get("/events/{user_id}")
 def get_recent_events(
     user_id: str,
@@ -1903,11 +2589,13 @@ def reset_user_memory(
         graph_summary = graph_memory_service.reset_user_memory(session=session, user_id=resolved_user_id)
     event_summary = delete_user_events(user_id=resolved_user_id)
     deleted_messages = delete_user_messages(user_id=resolved_user_id)
+    profile_summary = delete_user_profile(user_id=resolved_user_id)
     return {
         "user_id": resolved_user_id,
         "graph": graph_summary,
         "events": event_summary,
         "vector": {"deleted_messages": deleted_messages},
+        "profile": profile_summary,
     }
 
 
@@ -2008,6 +2696,51 @@ def ingest_memory_signals(
     }
 
 
+@app.post("/planner/company")
+def company_planner(
+    req: CompanyPlannerRequest,
+    graphmind_session: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME),
+) -> dict[str, object]:
+    resolved_user_id = _resolve_user_id(req.user_id, get_user_by_session_token(graphmind_session))
+    company = " ".join(req.company.split()).strip()
+    days_left = int(req.days_left or 14)
+    days_left = max(1, min(days_left, 60))
+    if not company:
+        raise HTTPException(status_code=400, detail="Company is required.")
+
+    planner_queries = _planner_queries(company)
+    plan = SearchPlan(
+        should_search=True,
+        intent="prep_guidance",
+        confidence=1.0,
+        entities={"entity": company, "entity_type": "organization", "role": "software engineer", "topic": ""},
+        queries=planner_queries,
+        reason="company planner research",
+    )
+    web_results = [
+        {"title": result.title, "snippet": result.snippet, "url": result.url}
+        for result in search_from_plan(plan, limit=6)
+    ]
+    memory_facts = _planner_memory_context(user_id=resolved_user_id)
+    profile_summary = fetch_profile_summary(user_id=resolved_user_id, limit=5)
+    planner = generate_company_planner(
+        company=company,
+        days_left=days_left,
+        web_results=web_results,
+        memory_facts=memory_facts,
+        profile_summary=profile_summary,
+    )
+    return {
+        "user_id": resolved_user_id,
+        "company": company,
+        "days_left": days_left,
+        "planner": planner,
+        "sources": web_results,
+        "memory_facts": memory_facts,
+        "profile_summary": profile_summary,
+    }
+
+
 @app.post("/chat")
 def chat(
     req: ChatRequest,
@@ -2015,6 +2748,8 @@ def chat(
     graphmind_session: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME),
 ) -> dict[str, object]:
     resolved_user_id = _resolve_user_id(req.user_id, get_user_by_session_token(graphmind_session))
+    with get_session() as session:
+        _ensure_user_node(session, user_id=resolved_user_id)
     start = time.time()
     conversation_id = req.conversation_id or f"convo-{uuid4().hex[:10]}"
     ensure_conversation(conversation_id=conversation_id, user_id=resolved_user_id)
@@ -2030,14 +2765,7 @@ def chat(
         created_at=now_iso,
     )
 
-    with get_session() as session:
-        user_msg_id = _neo4j_save_message(
-            session=session,
-            user_id=resolved_user_id,
-            conversation_id=conversation_id,
-            role="user",
-            text=req.message,
-        )
+    user_msg_id = str(uuid4())
 
     add_message(
         message_id=user_msg_id,
@@ -2198,18 +2926,12 @@ def chat(
     )
 
     with get_session() as session:
-        bot_msg_id = _neo4j_save_message(
-            session=session,
-            user_id=resolved_user_id,
-            conversation_id=conversation_id,
-            role="assistant",
-            text=answer,
-        )
         graph_memory = graph_memory_service.fetch_graph_memory(
             user_id=resolved_user_id,
             session=session,
             limit=10,
         )
+    bot_msg_id = str(uuid4())
 
     add_message(
         message_id=bot_msg_id,

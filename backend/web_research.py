@@ -7,7 +7,7 @@ import hashlib
 import math
 import re
 import time
-from urllib.parse import quote_plus
+from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 import httpx
 
@@ -195,7 +195,7 @@ def _prep_queries(*, entity: str, entity_type: str, role: str | None, semantic_t
 
 def _extract_target_entity(text: str) -> str | None:
     patterns = [
-        r"\b(?:for|at|with|focusing on|targeting|applying to)\s+([A-Za-z][A-Za-z0-9&.\- ]{1,40})",
+        r"\b(?:for|at|with|targeting|applying to)\s+([A-Za-z][A-Za-z0-9&.\- ]{1,40})",
     ]
     for pattern in patterns:
         match = re.search(pattern, text, flags=re.IGNORECASE)
@@ -275,12 +275,26 @@ def _extract_role(text: str) -> str | None:
 
 
 def _duckduckgo_search(query: str, limit: int = 4) -> list[WebResult]:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    with httpx.Client(timeout=8.0, follow_redirects=True, headers=headers) as client:
+        html_results = _duckduckgo_html_search(client=client, query=query, limit=limit)
+        if html_results:
+            return html_results[:limit]
+        lite_results = _duckduckgo_lite_search(client=client, query=query, limit=limit)
+        if lite_results:
+            return lite_results[:limit]
+    return []
+
+
+def _duckduckgo_html_search(*, client: httpx.Client, query: str, limit: int) -> list[WebResult]:
     url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
     try:
-        with httpx.Client(timeout=6.0, follow_redirects=True, headers={"User-Agent": "GraphMind/0.4"}) as client:
-            response = client.get(url)
-            response.raise_for_status()
-            html = response.text
+        response = client.get(url)
+        response.raise_for_status()
+        html = response.text
     except Exception:
         return []
 
@@ -304,12 +318,71 @@ def _duckduckgo_search(query: str, limit: int = 4) -> list[WebResult]:
 
     results: list[WebResult] = []
     for index, match in enumerate(title_matches[:limit]):
-        raw_url = unescape(match.group("url"))
+        raw_url = _decode_duckduckgo_url(unescape(match.group("url")))
         title = _clean_html(match.group("title"))
         snippet = snippets[index] if index < len(snippets) else ""
-        if title and raw_url:
+        if title and raw_url and _is_useful_search_result(raw_url, title=title, snippet=snippet):
             results.append(WebResult(title=title, snippet=snippet, url=raw_url))
     return results
+
+
+def _duckduckgo_lite_search(*, client: httpx.Client, query: str, limit: int) -> list[WebResult]:
+    url = f"https://lite.duckduckgo.com/lite/?q={quote_plus(query)}"
+    try:
+        response = client.get(url)
+        response.raise_for_status()
+        html = response.text
+    except Exception:
+        return []
+
+    results: list[WebResult] = []
+    pattern = re.compile(
+        r'<a[^>]*href="(?P<url>[^"]+)"[^>]*>(?P<title>.*?)</a>',
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    for match in pattern.finditer(html):
+        raw_url = _decode_duckduckgo_url(unescape(match.group("url")))
+        title = _clean_html(match.group("title"))
+        if not title or not raw_url:
+            continue
+        if not _is_useful_search_result(raw_url, title=title, snippet=""):
+            continue
+        results.append(WebResult(title=title, snippet="", url=raw_url))
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _decode_duckduckgo_url(url: str) -> str:
+    parsed = urlparse(url)
+    if "duckduckgo.com" not in (parsed.netloc or ""):
+        return url
+    query = parse_qs(parsed.query or "")
+    uddg = query.get("uddg")
+    if uddg and uddg[0]:
+        return unquote(uddg[0])
+    return url
+
+
+def _is_useful_search_result(url: str, *, title: str, snippet: str) -> bool:
+    lowered_url = (url or "").lower()
+    lowered_text = f"{title} {snippet}".lower()
+    blocked_fragments = (
+        "duckduckgo.com/y.js",
+        "jobrapido",
+        "talent.com",
+        "foundit",
+        "naukri.com",
+        "simplyhired",
+        "job openings",
+        "apply now",
+        "urgent hiring",
+    )
+    if any(fragment in lowered_url for fragment in blocked_fragments):
+        return False
+    if any(fragment in lowered_text for fragment in blocked_fragments):
+        return False
+    return True
 
 
 def _cache_key_for_plan(plan: SearchPlan, *, limit: int) -> str:

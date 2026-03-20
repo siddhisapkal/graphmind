@@ -10,6 +10,7 @@ from google import genai
 from groq import Groq
 
 from .graph.models import TripleCandidate
+from .graph.models import normalize_text_key
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -48,6 +49,8 @@ COMPANY_STOPWORDS = {
     "role",
     "job",
 }
+CACHE_VERSION = "v3"
+_COMPANY_CLASSIFICATION_CACHE: dict[str, str | None] = {}
 
 
 def _extraction_cache_path() -> Path:
@@ -76,7 +79,7 @@ def _connect_extraction_cache() -> sqlite3.Connection:
 
 
 def _extraction_cache_key(*, user_id: str, source: str, message: str) -> str:
-    payload = f"{user_id.strip().lower()}|{source.strip().lower()}|{' '.join(message.split()).strip().lower()}"
+    payload = f"{CACHE_VERSION}|{user_id.strip().lower()}|{source.strip().lower()}|{' '.join(message.split()).strip().lower()}"
     return hashlib.md5(payload.encode("utf-8")).hexdigest()
 
 
@@ -385,46 +388,63 @@ def extract_triple_candidates(*, user_id: str, message: str, source: str = "chat
         return heuristic_triples
 
     prompt = f"""
-Understand the meaning of the user message and extract durable memory in structured form.
-Return strict JSON with this shape:
+You are an intelligent semantic memory extraction system.
+
+Your task is to understand the MEANING of the user message and extract durable memory.
+
+IMPORTANT:
+- Understand intent, not exact wording.
+- The same meaning can be expressed in different ways.
+
+RELATION STRATEGY:
+- First, try to map the meaning to one of these CORE relations:
+
+  STRUGGLES_WITH
+  STUDIES
+  TARGETS
+  PREPARING_FOR
+  STRENGTH_IN
+  IMPROVING_IN
+  INTERESTED_IN
+
+- If the meaning clearly fits one of these, USE it.
+
+- If none of these fit well, then you MAY create a new relation dynamically that best describes the meaning.
+
+Examples:
+- "economics is confusing" -> STRUGGLES_WITH Economics
+- "i am studying polity" -> STUDIES Polity
+- "trying to get better at writing" -> IMPROVING_IN Answer Writing
+- "i revise daily" -> HAS_HABIT Revision
+
+Instructions:
+- Treat full message as one semantic unit
+- Combine sentences if needed
+- Resolve references like "it", "this"
+- Subject is always User({user_id})
+- Object must be short and atomic
+- Do NOT include full sentences
+- Do NOT extract meaningless data
+- Prefer Topic, Skill, Goal, Company, Domain, Concept, Entity, or Document as object_type
+- Do not turn academic topics into Company
+
+Confidence:
+- 0.8-1.0 -> clear
+- 0.5-0.7 -> inferred
+
+Output STRICT JSON:
 {{
   "user_facts": [
     {{
-      "relation": "TARGETS",
-      "object_type": "Company",
-      "object_name": "Google",
-      "confidence": 0.84,
+      "relation": "...",
+      "object_type": "Topic",
+      "object_name": "...",
+      "confidence": 0.0,
       "linked_to_action": false
     }}
   ],
-  "concept_relations": [
-    {{
-      "subject_type": "Concept",
-      "subject_name": "Fourier Transform",
-      "relation": "PART_OF",
-      "object_type": "Concept",
-      "object_name": "Signals and Systems",
-      "confidence": 0.9
-    }}
-  ]
+  "concept_relations": []
 }}
-
-Rules:
-- Understand meaning, not keywords. Do not infer the opposite sentiment.
-- If user says they are good/confident/strong in something, use STRENGTH_IN or IMPROVED_IN, never STRUGGLES_WITH.
-- If user says they are weak/confused/bad at something, use STRUGGLES_WITH.
-- If the user is asking for help learning, preparing, understanding, revising, or assessing themselves on a specific topic, you may infer a soft STUDIES fact for that topic even if they did not literally say "I am studying it".
-- If the user asks about their own preparation level for a topic, infer a user_fact about that topic rather than returning empty.
-- For direct topic-help requests like "tell me about opamp" or "help me prepare opamp", prefer Topic/Concept nodes, not Company.
-- Keep entity names short and atomic. Never include whole clauses.
-- subject/object types should be one of Company, Topic, Skill, Goal, Document, Entity, Domain, Concept.
-- user_facts are always from User({user_id}) to an object.
-- concept_relations are only for concept/domain/resource structure such as PART_OF, USED_IN, PREREQUISITE_FOR, COVERS, EMPHASIZES.
-- relation should be an uppercase snake case relation.
-- confidence must be between 0 and 1.
-- linked_to_action is true when the message indicates concrete work, practice, upload, scheduling, or execution.
-- Do not output vague nodes like "study", "learning", "preparation", "thing", "problem".
-- If nothing should be remembered, return empty arrays.
 
 User message: {message}
 """.strip()
@@ -503,6 +523,1063 @@ def _parse_semantic_response(text: str) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def generate_company_planner(
+    *,
+    company: str,
+    days_left: int,
+    web_results: list[dict[str, str]] | None = None,
+    memory_facts: list[str] | None = None,
+    profile_summary: dict[str, list[dict[str, object]]] | None = None,
+) -> dict[str, object]:
+    normalized_company = " ".join((company or "").split()).strip()
+    normalized_days = max(1, int(days_left))
+    compact_web = []
+    for item in list(web_results or [])[:6]:
+        title = " ".join(str(item.get("title") or "").split()).strip()
+        snippet = " ".join(str(item.get("snippet") or "").split()).strip()
+        url = " ".join(str(item.get("url") or "").split()).strip()
+        if title:
+            compact_web.append(f"{title}: {snippet} ({url})".strip())
+    compact_memory = [" ".join(str(item or "").split()).strip() for item in list(memory_facts or [])[:6] if str(item or "").strip()]
+    compact_profile = _compact_profile_summary(profile_summary)
+
+    prompt = f"""
+Create a company-wise placement planner.
+Return strict JSON only with this exact shape:
+{{
+  "company": "{normalized_company}",
+  "overview": "short summary",
+  "web_focus_topics": ["topic 1", "topic 2"],
+  "personalized_focus": {{
+    "strengths_to_use": ["strength 1"],
+    "weaknesses_to_focus": ["weakness 1"],
+    "improving_now": ["improving 1"]
+  }},
+  "fit_analysis": {{
+    "matched_strengths": ["strength matched to company topics"],
+    "matched_weaknesses": ["weakness matched to company topics"],
+    "strategic_summary": "short personalized analysis"
+  }},
+  "stages": [
+    {{
+      "name": "Coding Round",
+      "focus": "what to focus on",
+      "resource": "what to practice",
+      "expected_questions": ["arrays", "graphs"]
+    }}
+  ],
+  "daily_plan": [
+    {{
+      "day": 1,
+      "title": "Aptitude and reasoning",
+      "tasks": ["task 1", "task 2"],
+      "goal": "daily goal"
+    }}
+  ],
+  "recommendations": ["tip 1", "tip 2"],
+  "likely_previous_question_patterns": ["pattern 1", "pattern 2"]
+}}
+
+Rules:
+- Use the web findings to infer likely rounds, repeated interview themes, and preparation areas.
+- Use the memory facts to personalize the plan if they indicate strengths or weaknesses.
+- Keep stages practical and atomic.
+- The daily_plan must have exactly {normalized_days} entries.
+- Make the plan realistic for the actual company process found in the evidence.
+- Do not assume coding rounds unless the web findings suggest coding, DSA, online assessment, programming, or technical screening.
+- The company may be from any domain, not only software.
+- Different companies should produce materially different stages and tasks when the evidence differs.
+- Do not mention unavailable tools.
+- recommendations and likely_previous_question_patterns should be concise.
+- web_focus_topics should summarize the main areas repeatedly mentioned in the web evidence.
+- personalized_focus must map the user's strengths, weaknesses, and improving areas from the cached profile first, then memory facts if needed.
+- fit_analysis must compare company/web topics with the precomputed profile information.
+- matched_strengths should include strengths that help with the company topics.
+- matched_weaknesses should include weaknesses that may hurt performance for this company.
+- strategic_summary should clearly explain what to lean on and what to fix first.
+
+Memory facts:
+{json.dumps(compact_memory, ensure_ascii=True)}
+
+Cached profile summary:
+{json.dumps(compact_profile, ensure_ascii=True)}
+
+Web findings:
+{json.dumps(compact_web, ensure_ascii=True)}
+""".strip()
+
+    try:
+        client = _get_client()
+        response = client.models.generate_content(
+            model=SIGNAL_MODEL,
+            contents=prompt,
+        )
+        payload = _parse_semantic_response(response.text or "")
+        if isinstance(payload.get("daily_plan"), list) and isinstance(payload.get("stages"), list):
+            payload["company"] = str(payload.get("company") or normalized_company)
+            payload["daily_plan"] = _normalize_daily_plan(payload.get("daily_plan"), normalized_days)
+            payload["stages"] = _normalize_planner_stages(payload.get("stages"))
+            payload["web_focus_topics"] = _normalize_string_list(
+                payload.get("web_focus_topics"),
+                fallback=_fallback_web_focus_topics(list(web_results or [])),
+            )
+            payload["personalized_focus"] = _normalize_personalized_focus(
+                payload.get("personalized_focus"),
+                memory_facts=compact_memory,
+                profile_summary=compact_profile,
+            )
+            payload["fit_analysis"] = _normalize_fit_analysis(
+                payload.get("fit_analysis"),
+                web_topics=payload["web_focus_topics"],
+                personalized_focus=payload["personalized_focus"],
+                profile_summary=compact_profile,
+            )
+            payload["recommendations"] = _normalize_string_list(payload.get("recommendations"), fallback=["Prioritize the rounds most often mentioned in the evidence"])
+            payload["likely_previous_question_patterns"] = _normalize_string_list(
+                payload.get("likely_previous_question_patterns"),
+                fallback=["Review repeated themes from recent interview experiences"],
+            )
+            return payload
+    except Exception:
+        pass
+
+    default_stages = _fallback_planner_stages(company=normalized_company, web_results=list(web_results or []))
+    daily_plan = _fallback_daily_plan(
+        company=normalized_company,
+        days=normalized_days,
+        stages=default_stages,
+        web_results=list(web_results or []),
+        memory_facts=compact_memory,
+    )
+    return {
+        "company": normalized_company,
+        "overview": f"{normalized_company} planner generated from current interview-process evidence and personalized memory hints.",
+        "web_focus_topics": _fallback_web_focus_topics(list(web_results or [])),
+        "personalized_focus": _normalize_personalized_focus({}, memory_facts=compact_memory, profile_summary=compact_profile),
+        "fit_analysis": _normalize_fit_analysis(
+            {},
+            web_topics=_fallback_web_focus_topics(list(web_results or [])),
+            personalized_focus=_normalize_personalized_focus({}, memory_facts=compact_memory, profile_summary=compact_profile),
+            profile_summary=compact_profile,
+        ),
+        "stages": default_stages,
+        "daily_plan": daily_plan,
+        "recommendations": ["Prioritize weak topics first", "Do one timed practice block daily"],
+        "likely_previous_question_patterns": _fallback_question_patterns(list(web_results or [])),
+    }
+
+
+def analyze_strength_weakness_profile(
+    *,
+    message: str,
+    triples: list[TripleCandidate] | None = None,
+    web_facts: list[str] | None = None,
+    seed_observations: list[dict[str, object]] | None = None,
+) -> list[dict[str, object]]:
+    compact_triples = [
+        {
+            "relation": triple.relation,
+            "object_type": triple.object_type,
+            "object_name": triple.object_name,
+            "confidence": triple.confidence,
+        }
+        for triple in list(triples or [])[:10]
+        if triple.subject_type.strip().lower() == "user"
+    ]
+    compact_web = [
+        " ".join(str(item or "").split()).strip()
+        for item in list(web_facts or [])[:5]
+        if str(item or "").strip()
+    ]
+    compact_seed = [
+        {
+            "entity": str(item.get("entity") or "").strip(),
+            "entity_type": str(item.get("entity_type") or "Skill").strip() or "Skill",
+            "signal_type": str(item.get("signal_type") or "").strip().lower(),
+            "delta": float(item.get("delta") or 0.0),
+        }
+        for item in list(seed_observations or [])[:8]
+        if isinstance(item, dict) and str(item.get("entity") or "").strip()
+    ]
+    prompt = f"""
+Analyze the user's message and classify any self-assessment into strengths, weaknesses, and improving areas.
+Return strict JSON only with this exact shape:
+{{
+  "strengths": [
+    {{"entity": "Problem Solving", "entity_type": "Skill", "delta": 0.8, "rationale": "user says they are good at it"}}
+  ],
+  "weaknesses": [
+    {{"entity": "Dynamic Programming", "entity_type": "Skill", "delta": 0.9, "rationale": "user says it is challenging"}}
+  ],
+  "improving": [
+    {{"entity": "Timed Coding Rounds", "entity_type": "Skill", "delta": 0.7, "rationale": "user is actively working on it"}}
+  ]
+}}
+
+Rules:
+- Extract only atomic skills or topics.
+- Do not return sentence wrappers like "to improve in these areas", "advanced topics", "topics like", or "understanding core concepts".
+- Split grouped phrases into separate items.
+- Use `strengths` for areas the user says they are good at, strong in, comfortable with, or confident in.
+- Use `weaknesses` for areas the user says are challenging, weak, difficult, confusing, or where they struggle.
+- Use `improving` for areas the user says they are currently practicing, improving, working on, or building confidence in.
+- The same entity can appear in both `weaknesses` and `improving` if the user implies both.
+- Use the web context only to disambiguate the topic, not to invent signals.
+- If the user clearly gives self-assessment, do not return empty arrays for everything.
+
+Extracted user triples:
+{json.dumps(compact_triples, ensure_ascii=True)}
+
+Preliminary observations:
+{json.dumps(compact_seed, ensure_ascii=True)}
+
+Relevant web context:
+{json.dumps(compact_web, ensure_ascii=True)}
+
+User message:
+{message}
+""".strip()
+
+    try:
+        client = _get_client()
+        observations = _extract_bucketed_profile_observations_with_gemini(client=client, prompt=prompt)
+        filtered_observations = _filter_profile_observations(observations)
+        if filtered_observations:
+            return filtered_observations
+
+        candidates = _candidate_profile_entities_from_message(
+            message=message,
+            triples=triples,
+            seed_observations=seed_observations,
+        )
+        if candidates:
+            classified = _classify_profile_candidates_with_gemini(
+                client=client,
+                message=message,
+                candidates=candidates,
+                web_facts=compact_web,
+            )
+            filtered_classified = _filter_profile_observations(classified)
+            if filtered_classified:
+                return filtered_classified
+    except Exception:
+        pass
+
+    heuristic_profile = _self_assessment_fallback_observations(message)
+    if heuristic_profile:
+        return _filter_profile_observations(heuristic_profile)
+
+    fallback: list[dict[str, object]] = []
+    for triple in list(triples or []):
+        if triple.subject_type.strip().lower() != "user":
+            continue
+        relation = triple.relation.strip().upper()
+        signal_type = "neutral"
+        delta = 0.0
+        if relation == "STRUGGLES_WITH":
+            signal_type = "weakness"
+            delta = 0.9
+        elif relation == "STRENGTH_IN":
+            signal_type = "strength"
+            delta = 0.95
+        elif relation in {"IMPROVED_IN", "IMPROVING_IN"}:
+            signal_type = "improving"
+            delta = 0.55
+        elif relation == "STUDIES":
+            signal_type = "neutral"
+            delta = 0.1
+        if signal_type == "neutral" and delta == 0.0:
+            continue
+        fallback.append(
+            {
+                "entity": _clean_profile_entity_text(triple.object_name, triple.object_type),
+                "entity_type": triple.object_type,
+                "entity_key": normalize_text_key(triple.object_name),
+                "signal_type": signal_type,
+                "delta": delta,
+                "rationale": relation.lower(),
+            }
+        )
+    deduped: dict[tuple[str, str], dict[str, object]] = {}
+    for item in fallback:
+        if not _is_useful_profile_entity(str(item.get("entity") or "")):
+            continue
+        key = (str(item.get("entity_key") or ""), str(item.get("signal_type") or ""))
+        existing = deduped.get(key)
+        if existing is None or float(item.get("delta") or 0.0) > float(existing.get("delta") or 0.0):
+            deduped[key] = item
+    return list(deduped.values())
+
+
+def _normalize_string_list(value: object, *, fallback: list[str]) -> list[str]:
+    items = [str(item).strip() for item in list(value or []) if str(item).strip()]
+    return items[:6] or fallback
+
+
+def _normalize_planner_stages(value: object) -> list[dict[str, object]]:
+    stages: list[dict[str, object]] = []
+    for item in list(value or []):
+        if not isinstance(item, dict):
+            continue
+        stages.append(
+            {
+                "name": str(item.get("name") or "Stage").strip() or "Stage",
+                "focus": str(item.get("focus") or "").strip(),
+                "resource": str(item.get("resource") or "").strip(),
+                "expected_questions": [str(question).strip() for question in list(item.get("expected_questions") or []) if str(question).strip()][:5],
+            }
+        )
+    return stages[:8]
+
+
+def _normalize_personalized_focus(
+    value: object,
+    *,
+    memory_facts: list[str],
+    profile_summary: dict[str, list[dict[str, object]]] | None = None,
+) -> dict[str, list[str]]:
+    payload = value if isinstance(value, dict) else {}
+    profile = profile_summary or {}
+    strengths = _normalize_string_list(
+        payload.get("strengths_to_use"),
+        fallback=_profile_entities_from_summary(profile.get("strengths")) or _profile_terms(memory_facts, prefix="STRENGTH_PROFILE"),
+    )
+    weaknesses = _normalize_string_list(
+        payload.get("weaknesses_to_focus"),
+        fallback=_profile_entities_from_summary(profile.get("weaknesses")) or _profile_terms(memory_facts, prefix="WEAKNESS_PROFILE"),
+    )
+    improving = _normalize_string_list(
+        payload.get("improving_now"),
+        fallback=_profile_entities_from_summary(profile.get("improving")) or _profile_terms(memory_facts, prefix="IMPROVING_PROFILE"),
+    )
+    return {
+        "strengths_to_use": strengths[:5],
+        "weaknesses_to_focus": weaknesses[:5],
+        "improving_now": improving[:5],
+    }
+
+
+def _normalize_fit_analysis(
+    value: object,
+    *,
+    web_topics: list[str],
+    personalized_focus: dict[str, list[str]],
+    profile_summary: dict[str, list[dict[str, object]]] | None = None,
+) -> dict[str, object]:
+    payload = value if isinstance(value, dict) else {}
+    strengths = list(personalized_focus.get("strengths_to_use") or [])
+    weaknesses = list(personalized_focus.get("weaknesses_to_focus") or [])
+    improving = list(personalized_focus.get("improving_now") or [])
+    profile = profile_summary or {}
+    profile_strengths = list(profile.get("strengths") or [])
+    profile_weaknesses = list(profile.get("weaknesses") or [])
+    profile_improving = list(profile.get("improving") or [])
+    fallback_strength_matches = _match_profile_summary_to_topics(profile_strengths, web_topics)
+    fallback_weakness_matches = _match_profile_summary_to_topics(profile_weaknesses + profile_improving, web_topics)
+    matched_strengths = _normalize_string_list(
+        payload.get("matched_strengths"),
+        fallback=fallback_strength_matches or _match_profile_to_topics(strengths, web_topics),
+    )
+    matched_weaknesses = _normalize_string_list(
+        payload.get("matched_weaknesses"),
+        fallback=fallback_weakness_matches or _match_profile_to_topics(weaknesses + improving, web_topics),
+    )
+    strategic_summary = str(payload.get("strategic_summary") or "").strip()
+    if not strategic_summary:
+        if matched_strengths and matched_weaknesses:
+            strategic_summary = (
+                f"Use {', '.join(matched_strengths[:2])} as your advantage, and start by fixing "
+                f"{', '.join(matched_weaknesses[:2])} because those areas are likely to show up in this company process."
+            )
+        elif matched_weaknesses:
+            strategic_summary = (
+                f"Start with {', '.join(matched_weaknesses[:2])} because that overlaps with the company topics and is the clearest risk area right now."
+            )
+        elif matched_strengths:
+            strategic_summary = (
+                f"Lean on {', '.join(matched_strengths[:2])} because your cached strengths already align with the company topics."
+            )
+        elif strengths or weaknesses or improving:
+            strategic_summary = (
+                "Your cached profile exists, but the overlap with the detected company topics is still broad. Use the web topics to guide preparation and keep updating your profile through chat."
+            )
+        else:
+            strategic_summary = (
+                "No strong cached profile signals are available yet, so this planner is leaning mostly on the current web evidence."
+            )
+    return {
+        "matched_strengths": matched_strengths[:5],
+        "matched_weaknesses": matched_weaknesses[:5],
+        "strategic_summary": strategic_summary,
+    }
+
+
+def _normalize_daily_plan(value: object, days: int) -> list[dict[str, object]]:
+    items: list[dict[str, object]] = []
+    for raw in list(value or []):
+        if not isinstance(raw, dict):
+            continue
+        try:
+            day = int(raw.get("day") or 0)
+        except (TypeError, ValueError):
+            day = 0
+        items.append(
+            {
+                "day": day,
+                "title": str(raw.get("title") or "Preparation block").strip() or "Preparation block",
+                "tasks": [str(task).strip() for task in list(raw.get("tasks") or []) if str(task).strip()][:5],
+                "goal": str(raw.get("goal") or "").strip(),
+            }
+        )
+    items = [item for item in items if item["tasks"] or item["goal"] or item["title"]]
+    items = items[:days]
+    while len(items) < days:
+        next_day = len(items) + 1
+        items.append(
+            {
+                "day": next_day,
+                "title": "Focused practice",
+                "tasks": ["Review the most repeated round themes from the company evidence"],
+                "goal": "Close one gap before the next round",
+            }
+        )
+    for index, item in enumerate(items, start=1):
+        item["day"] = index
+    return items
+
+
+def _fallback_planner_stages(*, company: str, web_results: list[dict[str, str]]) -> list[dict[str, object]]:
+    combined = " ".join(
+        " ".join(
+            [
+                str(item.get("title") or ""),
+                str(item.get("snippet") or ""),
+            ]
+        )
+        for item in web_results
+    ).lower()
+    stages: list[dict[str, object]] = []
+
+    if re.search(r"\b(aptitude|quant|reasoning|psychometric|assessment)\b", combined):
+        stages.append(
+            {
+                "name": "Assessment Round",
+                "focus": "speed, reasoning, and accuracy",
+                "resource": "timed practice sets",
+                "expected_questions": ["aptitude", "logical reasoning", "short assessments"],
+            }
+        )
+    coding_allowed = not re.search(r"\b(no coding|without coding|no coding questions)\b", combined)
+    if coding_allowed and re.search(r"\b(coding|programming|dsa|algorithm|hackerrank|leetcode|online assessment)\b", combined):
+        stages.append(
+            {
+                "name": "Coding Round",
+                "focus": "problem solving under time pressure",
+                "resource": "timed coding questions",
+                "expected_questions": ["arrays", "strings", "graphs"],
+            }
+        )
+    if re.search(r"\b(mcq|multiple choice|written test|technical mcq)\b", combined):
+        stages.append(
+            {
+                "name": "Written Technical Test",
+                "focus": "objective technical concepts and fast elimination",
+                "resource": "MCQ revision sets",
+                "expected_questions": ["technical MCQs", "fundamental concepts", "short applied questions"],
+            }
+        )
+    if re.search(r"\b(analog|digital|semiconductor|electronics|vlsi|circuits|embedded)\b", combined):
+        stages.append(
+            {
+                "name": "Domain Fundamentals",
+                "focus": "company-specific core domain topics",
+                "resource": "domain revision and concept review",
+                "expected_questions": ["core fundamentals", "domain scenarios", "design basics"],
+            }
+        )
+    if re.search(r"\b(case study|guesstimate|analysis|business case|analyst)\b", combined):
+        stages.append(
+            {
+                "name": "Case or Analysis Round",
+                "focus": "structured reasoning and communication",
+                "resource": "case frameworks and mock analysis",
+                "expected_questions": ["case walkthroughs", "analysis questions", "decision making"],
+            }
+        )
+    if re.search(r"\b(group discussion|presentation|communication|hr|behavioral|behavioural)\b", combined):
+        stages.append(
+            {
+                "name": "Communication Round",
+                "focus": "clear speaking and behavioral responses",
+                "resource": "mock speaking and behavioral prompts",
+                "expected_questions": ["introduce yourself", "teamwork", "conflict handling"],
+            }
+        )
+    if re.search(r"\b(technical|interview|domain|fundamentals)\b", combined):
+        stages.append(
+            {
+                "name": "Technical or Domain Interview",
+                "focus": "core concepts and explanation clarity",
+                "resource": "topic revision and mock interview",
+                "expected_questions": ["fundamentals", "applied questions", "scenario-based questions"],
+            }
+        )
+    if not stages:
+        stages = [
+            {
+                "name": "Screening Round",
+                "focus": "understand the likely first-stage filters",
+                "resource": "company-specific experience writeups",
+                "expected_questions": ["screening questions", "common themes"],
+            },
+            {
+                "name": "Interview Round",
+                "focus": "structured answers and topic revision",
+                "resource": "mock interview practice",
+                "expected_questions": ["repeated interview themes", "company-specific questions"],
+            },
+        ]
+    return stages[:5]
+
+
+def _fallback_question_patterns(web_results: list[dict[str, str]]) -> list[str]:
+    combined = " ".join(
+        " ".join([str(item.get("title") or ""), str(item.get("snippet") or "")])
+        for item in web_results
+    ).lower()
+    patterns: list[str] = []
+    if "aptitude" in combined or "reasoning" in combined:
+        patterns.append("Aptitude and reasoning screening")
+    if re.search(r"\b(coding|programming|dsa|algorithm)\b", combined):
+        patterns.append("Problem-solving and coding questions")
+    if re.search(r"\b(mcq|multiple choice|written test)\b", combined):
+        patterns.append("Written technical MCQs and quick concept checks")
+    if re.search(r"\b(hr|behavioral|behavioural|communication)\b", combined):
+        patterns.append("Behavioral and communication prompts")
+    if re.search(r"\b(case|analysis|analyst)\b", combined):
+        patterns.append("Case-style or analytical reasoning questions")
+    if re.search(r"\b(technical|domain|fundamentals)\b", combined):
+        patterns.append("Core technical or domain fundamentals")
+    if re.search(r"\b(analog|digital|semiconductor|electronics|vlsi|circuits|embedded)\b", combined):
+        patterns.append("Domain-specific fundamentals and applied concept questions")
+    return patterns or ["Repeated round themes from company interview experiences"]
+
+
+def _fallback_web_focus_topics(web_results: list[dict[str, str]]) -> list[str]:
+    combined = " ".join(
+        " ".join([str(item.get("title") or ""), str(item.get("snippet") or "")])
+        for item in web_results
+    ).lower()
+    topics: list[str] = []
+    if re.search(r"\b(aptitude|reasoning|quant)\b", combined):
+        topics.append("Aptitude and reasoning")
+    if re.search(r"\b(coding|dsa|algorithm|problem solving|online assessment)\b", combined):
+        topics.append("Coding and problem solving")
+    if re.search(r"\b(hr|behavioral|behavioural|communication)\b", combined):
+        topics.append("Behavioral and communication")
+    if re.search(r"\b(system design|design)\b", combined):
+        topics.append("System or design thinking")
+    if re.search(r"\b(technical|dbms|os|oops|cn|fundamentals)\b", combined):
+        topics.append("Core technical fundamentals")
+    if re.search(r"\b(analog|digital|semiconductor|electronics|vlsi|circuits|embedded)\b", combined):
+        topics.append("Domain-specific fundamentals")
+    return topics or ["Recruitment-process topics inferred from interview experiences"]
+
+
+def _profile_terms(memory_facts: list[str], *, prefix: str) -> list[str]:
+    results: list[str] = []
+    for fact in memory_facts:
+        if prefix not in fact:
+            continue
+        match = re.search(r"->\s*(.*?)\s*\(", fact)
+        if match:
+            value = match.group(1).strip()
+            if value:
+                results.append(value)
+    return results
+
+
+def _profile_entities_from_summary(items: object) -> list[str]:
+    results: list[str] = []
+    for item in list(items or []):
+        if not isinstance(item, dict):
+            continue
+        entity = str(item.get("entity") or "").strip()
+        if entity:
+            results.append(entity)
+    return results
+
+
+def _match_profile_to_topics(profile_items: list[str], web_topics: list[str]) -> list[str]:
+    results: list[str] = []
+    normalized_topics = [(topic, set(normalize_text_key(topic).split())) for topic in web_topics if topic]
+    for item in profile_items:
+        item_key = normalize_text_key(item)
+        item_tokens = set(item_key.split())
+        if not item_tokens:
+            continue
+        matched = False
+        for topic, topic_tokens in normalized_topics:
+            if item_key in normalize_text_key(topic) or normalize_text_key(topic) in item_key or (item_tokens & topic_tokens):
+                results.append(f"{item} -> {topic}")
+                matched = True
+                break
+        if not matched and any(token in {"coding", "problem", "technical", "design", "communication", "reasoning"} for token in item_tokens):
+            results.append(item)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in results:
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def _compact_profile_summary(
+    profile_summary: dict[str, list[dict[str, object]]] | None,
+) -> dict[str, list[dict[str, object]]]:
+    compact: dict[str, list[dict[str, object]]] = {"strengths": [], "weaknesses": [], "improving": []}
+    for section in ("strengths", "weaknesses", "improving"):
+        for item in list((profile_summary or {}).get(section) or [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            entity = str(item.get("entity") or "").strip()
+            if not entity:
+                continue
+            compact[section].append(
+                {
+                    "entity": entity,
+                    "entity_type": str(item.get("entity_type") or "Skill").strip() or "Skill",
+                    "score": round(float(item.get("score") or 0.0), 2),
+                    "improving_score": round(float(item.get("improving_score") or 0.0), 2),
+                    "evidence_count": int(item.get("evidence_count") or 0),
+                }
+            )
+    return compact
+
+
+def _extract_bucketed_profile_observations_with_gemini(*, client: genai.Client, prompt: str) -> list[dict[str, object]]:
+    response = client.models.generate_content(
+        model=SIGNAL_MODEL,
+        contents=prompt,
+    )
+    payload = _parse_semantic_response(response.text or "")
+    observations: list[dict[str, object]] = []
+    for signal_type, bucket in (
+        ("strength", payload.get("strengths")),
+        ("weakness", payload.get("weaknesses")),
+        ("improving", payload.get("improving")),
+    ):
+        for item in list(bucket or []):
+            if not isinstance(item, dict):
+                continue
+            entity = str(item.get("entity") or "").strip()
+            entity_type = str(item.get("entity_type") or "Skill").strip() or "Skill"
+            rationale = str(item.get("rationale") or "").strip()
+            try:
+                delta = float(item.get("delta") or 0.0)
+            except (TypeError, ValueError):
+                delta = 0.0
+            if not entity:
+                continue
+            observations.append(
+                {
+                    "entity": _clean_profile_entity_text(entity, entity_type),
+                    "entity_type": entity_type,
+                    "entity_key": normalize_text_key(entity),
+                    "signal_type": signal_type,
+                    "delta": max(-1.5, min(delta, 1.5)),
+                    "rationale": rationale,
+                }
+            )
+    return observations
+
+
+def _classify_profile_candidates_with_gemini(
+    *,
+    client: genai.Client,
+    message: str,
+    candidates: list[str],
+    web_facts: list[str] | None = None,
+) -> list[dict[str, object]]:
+    prompt = f"""
+Classify whether each candidate topic from the user's message should count as a strength, weakness, improving area, or be ignored.
+Return strict JSON only with this exact shape:
+{{
+  "items": [
+    {{
+      "entity": "Problem Solving",
+      "entity_type": "Skill",
+      "signal_type": "strength",
+      "delta": 0.8,
+      "rationale": "user explicitly says they are strong in it"
+    }}
+  ]
+}}
+
+Rules:
+- signal_type must be one of: strength, weakness, improving, ignore
+- Use ignore for vague, generic, or unsupported candidates.
+- Classify based on the user's wording first.
+- Use the web context only to understand whether the candidate is a relevant interview/preparation topic.
+- Do not invent candidates.
+- Keep entity short and atomic.
+
+Candidates:
+{json.dumps(candidates[:10], ensure_ascii=True)}
+
+Relevant web context:
+{json.dumps(list(web_facts or [])[:5], ensure_ascii=True)}
+
+User message:
+{message}
+""".strip()
+    response = client.models.generate_content(
+        model=SIGNAL_MODEL,
+        contents=prompt,
+    )
+    payload = _parse_semantic_response(response.text or "")
+    observations: list[dict[str, object]] = []
+    for item in list(payload.get("items") or []):
+        if not isinstance(item, dict):
+            continue
+        entity = str(item.get("entity") or "").strip()
+        entity_type = str(item.get("entity_type") or "Skill").strip() or "Skill"
+        signal_type = str(item.get("signal_type") or "ignore").strip().lower()
+        rationale = str(item.get("rationale") or "").strip()
+        try:
+            delta = float(item.get("delta") or 0.0)
+        except (TypeError, ValueError):
+            delta = 0.0
+        if not entity or signal_type not in {"strength", "weakness", "improving"}:
+            continue
+        observations.append(
+            {
+                "entity": _clean_profile_entity_text(entity, entity_type),
+                "entity_type": entity_type,
+                "entity_key": normalize_text_key(entity),
+                "signal_type": signal_type,
+                "delta": max(-1.5, min(delta or 0.7, 1.5)),
+                "rationale": rationale or "candidate_classification",
+            }
+        )
+    return observations
+
+
+def _message_has_self_assessment_cues(message: str) -> bool:
+    lowered = " ".join((message or "").lower().split())
+    patterns = (
+        r"\bi am good at\b",
+        r"\bi am strong in\b",
+        r"\bi am confident in\b",
+        r"\bi am comfortable with\b",
+        r"\bi am weak in\b",
+        r"\bi struggle with\b",
+        r"\bi am working on\b",
+        r"\bi am improving\b",
+        r"\bi am practicing\b",
+        r"\bmy strength\b",
+        r"\bmy weakness\b",
+        r"\bi find .* challenging\b",
+    )
+    return any(re.search(pattern, lowered) for pattern in patterns)
+
+
+def _candidate_profile_entities_from_message(
+    *,
+    message: str,
+    triples: list[TripleCandidate] | None = None,
+    seed_observations: list[dict[str, object]] | None = None,
+) -> list[str]:
+    results: list[str] = []
+    text = " ".join((message or "").split())
+    cue_patterns = (
+        r"\b(?:i am|i'm)\s+(?:good at|strong in|confident in|comfortable with)\s+(.+?)(?:[.!]|$)",
+        r"\b(?:i am|i'm)\s+(?:weak in|struggling with|working on|improving|actively improving)\s+(.+?)(?:[.!]|$)",
+        r"\b(?:i find)\s+(.+?)\s+(?:challenging|difficult|hard|tricky)(?:[.!]|$)",
+        r"\b(?:focusing on improving|aiming to become|building confidence in)\s+(.+?)(?:[.!]|$)",
+    )
+    for pattern in cue_patterns:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            results.extend(_split_profile_entities(match.group(1)))
+    for item in list(seed_observations or [])[:8]:
+        if not isinstance(item, dict):
+            continue
+        entity = _clean_profile_entity_text(
+            str(item.get("entity") or ""),
+            str(item.get("entity_type") or "Skill"),
+        )
+        if _is_useful_profile_entity(entity):
+            results.append(entity)
+    for triple in list(triples or [])[:10]:
+        if triple.subject_type.strip().lower() != "user":
+            continue
+        entity = _clean_profile_entity_text(triple.object_name, triple.object_type)
+        if _is_useful_profile_entity(entity):
+            results.append(entity)
+    return _dedupe_strings(results)
+
+
+def _self_assessment_fallback_observations(message: str) -> list[dict[str, object]]:
+    text = " ".join((message or "").split())
+    if not _message_has_self_assessment_cues(text):
+        return []
+    observations: list[dict[str, object]] = []
+    patterns = [
+        (r"\b(?:i am|i'm)\s+(?:good at|strong in|confident in|comfortable with)\s+(.+?)(?:[.!]|$)", "strength", 0.85),
+        (r"\b(?:i am|i'm)\s+(?:weak in|struggling with)\s+(.+?)(?:[.!]|$)", "weakness", 0.9),
+        (r"\b(?:i am|i'm)\s+(?:working on|improving|actively improving)\s+(.+?)(?:[.!]|$)", "improving", 0.78),
+        (r"\b(?:i find)\s+(.+?)\s+(?:challenging|difficult|hard|tricky)(?:[.!]|$)", "weakness", 0.82),
+        (r"\b(?:aiming to become|focusing on improving|build(?:ing)? confidence in)\s+(.+?)(?:[.!]|$)", "improving", 0.72),
+    ]
+    for pattern, signal_type, delta in patterns:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            phrase = match.group(1).strip(" .,-")
+            for entity in _split_profile_entities(phrase):
+                observations.append(
+                    {
+                        "entity": entity,
+                        "entity_type": "Skill",
+                        "entity_key": normalize_text_key(entity),
+                        "signal_type": signal_type,
+                        "delta": delta,
+                        "rationale": "self_assessment_fallback",
+                    }
+                )
+    return observations
+
+
+def _split_profile_entities(text: str) -> list[str]:
+    cleaned = re.sub(r"\b(?:my|skills? in|performance in|knowledge of|topics like|areas like)\b", " ", text, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(?:and|or)\b", ",", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.replace("/", ",")
+    parts = [part.strip(" .,-") for part in cleaned.split(",")]
+    results: list[str] = []
+    for part in parts:
+        candidate = _clean_profile_entity_text(part, "Skill")
+        if _is_useful_profile_entity(candidate):
+            results.append(candidate)
+    return _dedupe_strings(results)
+
+
+def _clean_profile_entity_text(entity: str, entity_type: str) -> str:
+    cleaned = _clean_entity_text(entity, entity_type)
+    cleaned = re.sub(r"^(topics?|skills?|areas?)\s+(like|such as)\s+", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"^(working on|improving in|good at|confident in|comfortable with)\s+", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"\b(for interviews?|in these areas|these areas|those areas)\b", "", cleaned, flags=re.IGNORECASE).strip(" ,.-")
+    return cleaned
+
+
+def _filter_profile_observations(observations: list[dict[str, object]]) -> list[dict[str, object]]:
+    filtered: list[dict[str, object]] = []
+    for item in observations:
+        entity = _clean_profile_entity_text(
+            str(item.get("entity") or ""),
+            str(item.get("entity_type") or "Skill"),
+        )
+        if not _is_useful_profile_entity(entity):
+            continue
+        updated = dict(item)
+        updated["entity"] = entity
+        updated["entity_key"] = normalize_text_key(entity)
+        if str(updated.get("signal_type") or "").strip().lower() == "neutral":
+            continue
+        filtered.append(updated)
+    deduped: dict[tuple[str, str], dict[str, object]] = {}
+    for item in filtered:
+        key = (str(item.get("entity_key") or ""), str(item.get("signal_type") or ""))
+        existing = deduped.get(key)
+        if existing is None or float(item.get("delta") or 0.0) > float(existing.get("delta") or 0.0):
+            deduped[key] = item
+    return list(deduped.values())
+
+
+def _is_useful_profile_entity(entity: str) -> bool:
+    value = " ".join((entity or "").split()).strip()
+    if not value:
+        return False
+    lowered = value.lower()
+    blocked_phrases = {
+        "these areas",
+        "those areas",
+        "to improve in these areas",
+        "topics like",
+        "skills like",
+        "core concepts",
+        "understanding core concepts",
+        "programming fundamentals and problem solving",
+        "advanced topics",
+        "coding interviews",
+    }
+    if lowered in blocked_phrases:
+        return False
+    if len(lowered) < 3:
+        return False
+    if len(lowered) > 48:
+        return False
+    if re.search(r"\b(this|that|these|those|something|anything|everything)\b", lowered):
+        return False
+    if lowered.startswith(("to ", "for ", "in ", "with ", "on ")):
+        return False
+    alpha_tokens = re.findall(r"[a-zA-Z0-9\+\#]+", lowered)
+    if not alpha_tokens:
+        return False
+    if len(alpha_tokens) > 7:
+        return False
+    return True
+
+
+def _match_profile_summary_to_topics(
+    profile_items: list[dict[str, object]],
+    web_topics: list[str],
+) -> list[str]:
+    results: list[str] = []
+    for item in profile_items:
+        if not isinstance(item, dict):
+            continue
+        entity = str(item.get("entity") or "").strip()
+        if not entity:
+            continue
+        topic = _best_topic_match(entity, web_topics)
+        if not topic:
+            continue
+        score = float(item.get("score") or 0.0)
+        improving_score = float(item.get("improving_score") or 0.0)
+        evidence_count = int(item.get("evidence_count") or 0)
+        meta_bits: list[str] = []
+        if abs(score) >= 0.35:
+            meta_bits.append(f"score {score:.2f}")
+        if improving_score > 0.3:
+            meta_bits.append(f"improving {improving_score:.2f}")
+        if evidence_count > 0:
+            meta_bits.append(f"{evidence_count} signals")
+        meta = f" ({', '.join(meta_bits)})" if meta_bits else ""
+        results.append(f"{entity} -> {topic}{meta}")
+    return _dedupe_strings(results)
+
+
+def _best_topic_match(entity: str, web_topics: list[str]) -> str | None:
+    entity_key = normalize_text_key(entity)
+    entity_tokens = set(entity_key.split())
+    if not entity_tokens:
+        return None
+    entity_categories = _semantic_categories(entity_key)
+    best_topic = None
+    best_score = 0
+    for topic in web_topics:
+        topic_key = normalize_text_key(topic)
+        topic_tokens = set(topic_key.split())
+        topic_categories = _semantic_categories(topic_key)
+        overlap = len(entity_tokens & topic_tokens)
+        category_overlap = len(entity_categories & topic_categories)
+        contains_bonus = 2 if (entity_key in topic_key or topic_key in entity_key) else 0
+        score = overlap + (category_overlap * 3) + contains_bonus
+        if score > best_score:
+            best_score = score
+            best_topic = topic
+    return best_topic if best_score > 0 else None
+
+
+def _semantic_categories(text: str) -> set[str]:
+    categories: set[str] = set()
+    checks = {
+        "coding": r"\b(coding|code|programming|problem|problem solving|dsa|algorithm|arrays?|strings?|graphs?|trees?|dp|dynamic programming|leetcode|debugging)\b",
+        "technical": r"\b(technical|fundamentals|oops|os|dbms|cn|computer science|core concepts|optimization)\b",
+        "design": r"\b(system design|design|architecture|scalability|distributed)\b",
+        "communication": r"\b(communication|behavioral|behavioural|interview|confidence|speaking|presentation|hr)\b",
+        "assessment": r"\b(aptitude|reasoning|quant|assessment|mcq|written)\b",
+        "domain": r"\b(domain|analog|digital|semiconductor|electronics|embedded|vlsi|circuits)\b",
+    }
+    for name, pattern in checks.items():
+        if re.search(pattern, text):
+            categories.add(name)
+    return categories
+
+
+def _dedupe_strings(items: list[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        key = item.strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item.strip())
+    return deduped
+
+
+def _fallback_daily_plan(
+    *,
+    company: str,
+    days: int,
+    stages: list[dict[str, object]],
+    web_results: list[dict[str, str]],
+    memory_facts: list[str],
+) -> list[dict[str, object]]:
+    if not stages:
+        stages = [
+            {
+                "name": "Preparation Round",
+                "focus": "company-specific interview readiness",
+                "resource": "practice and revision",
+                "expected_questions": ["common interview themes"],
+            }
+        ]
+    weak_hint = next((fact for fact in memory_facts if "STRUGGLES_WITH" in fact or "STUDIES" in fact), "")
+    stage_cycle = [stages[index % len(stages)] for index in range(days)]
+    question_patterns = _fallback_question_patterns(web_results)
+    daily_plan: list[dict[str, object]] = []
+    for day in range(1, days + 1):
+        stage = stage_cycle[day - 1]
+        stage_name = str(stage.get("name") or "Preparation")
+        focus = str(stage.get("focus") or "focused practice")
+        expected = [str(item) for item in list(stage.get("expected_questions") or []) if str(item)]
+        primary_question = expected[0] if expected else "common questions"
+        if day <= max(2, days // 3):
+            title = f"Foundation: {stage_name}"
+            tasks = [
+                f"Map the {company} {stage_name.lower()} expectations from recent interview experiences",
+                f"Revise {focus}",
+                f"Practice 8-12 questions around {primary_question}",
+            ]
+            goal = f"Build baseline confidence for {stage_name.lower()}."
+        elif day <= max(4, (2 * days) // 3):
+            title = f"Practice Sprint: {stage_name}"
+            tasks = [
+                f"Do one timed practice block for {stage_name.lower()}",
+                f"Review mistakes from {primary_question}",
+                f"Summarize repeat patterns: {question_patterns[(day - 1) % len(question_patterns)]}",
+            ]
+            goal = f"Convert revision into performance for {stage_name.lower()}."
+        elif day < days:
+            title = f"Mock and Review: {stage_name}"
+            tasks = [
+                f"Run one mock session focused on {stage_name.lower()}",
+                f"Fix two weak areas from earlier attempts",
+                f"Prepare concise answers for {primary_question}",
+            ]
+            goal = f"Simulate the real round and tighten weak spots."
+        else:
+            title = "Final Revision and Confidence Check"
+            tasks = [
+                f"Review the highest-probability rounds for {company}",
+                f"Revisit the most repeated question patterns from the web evidence",
+                f"Do a calm final pass on {weak_hint or 'your weakest area'}",
+            ]
+            goal = f"Enter the {company} process with a clean revision summary and confidence."
+        daily_plan.append(
+            {
+                "day": day,
+                "title": title,
+                "tasks": tasks,
+                "goal": goal,
+            }
+        )
+    return daily_plan
+
+
 def _semantic_interest_fallback(*, user_id: str, message: str, source: str) -> list[TripleCandidate]:
     prompt = f"""
 Decide whether this user message implies durable user-interest or preparation memory.
@@ -518,6 +1595,10 @@ Return strict JSON with this exact shape:
 
 Rules:
 - Use should_store=false if the message does not imply durable user interest, preparation, weakness, goal, or study intent.
+- Read the whole message semantically, including 2-3 sentence messages and conjunction-heavy phrasing, before deciding.
+- If the user names a topic in one part of the message and expresses preparation, interest, confusion, or weakness in another part, connect them.
+- Do not require rigid sentence forms. The user may express preparation or weakness in any wording.
+- Abstract abilities and academic habits count too, for example answer writing, revision, communication, analysis, time management, and consistency.
 - If the message asks for help learning, preparing, revising, understanding, teaching, or assessing a specific topic, field, concept, technology, company, exam, or domain, you may store a soft memory signal.
 - If the message asks about the user's own preparation level for something, store a soft memory signal for that subject.
 - Prefer STUDIES for topics/fields/concepts, TARGETS for companies, and PREPARES_FOR for roles/exams/goals.
@@ -530,6 +1611,9 @@ Rules:
   - "do you know my preparation level of dbms"
   - "i need help with analog electronics"
   - "what should i study for compiler design"
+  - "i want to improve my answer writing"
+  - "my revision is weak"
+  - "i need to work on communication"
 
 User message: {message}
 """.strip()
@@ -574,6 +1658,8 @@ def _broad_interest_fallback(*, user_id: str, message: str, source: str) -> list
     patterns = [
         r"(?:tell me about|teach me about|explain|help me with|help me understand|i need help with|guide me in)\s+([a-z0-9 +#&/().,\-]{2,80})",
         r"(?:help me prepare|prepare me for|what should i study for|how do i prepare for|my preparation level of)\s+([a-z0-9 +#&/().,\-]{2,80})",
+        r"(?:i want to improve|i need to improve|i need to work on|i want to work on)\s+(?:my\s+)?([a-z0-9 +#&/().,\-]{2,80})",
+        r"(?:my\s+)([a-z0-9 +#&/().,\-]{2,80})\s+(?:is|feels)\s+(?:weak|poor|bad|difficult|hard|confusing|tricky|tough)",
     ]
 
     raw_subject = ""
@@ -589,10 +1675,16 @@ def _broad_interest_fallback(*, user_id: str, message: str, source: str) -> list
     if not raw_subject:
         return []
 
-    looks_like_company = _is_valid_company_name(raw_subject.title()) and raw_subject.lower() not in COMPANY_STOPWORDS and raw_subject[:1].isupper()
+    resolved_company = _resolve_company_name(raw_subject)
+    looks_like_company = bool(resolved_company)
+    abstract_skill_terms = {"answer writing", "revision", "communication", "analysis", "time management", "consistency", "problem solving", "writing speed", "presentation", "clarity"}
     object_type = "Company" if looks_like_company else "Topic"
     relation = "TARGETS" if object_type == "Company" else "STUDIES"
-    object_name = _clean_entity_text(raw_subject, object_type)
+    normalized_subject = raw_subject.strip().lower()
+    if normalized_subject in abstract_skill_terms:
+        object_type = "Skill"
+        relation = "IMPROVED_IN" if re.search(r"\bimprove|work on\b", lowered) else "STRUGGLES_WITH"
+    object_name = resolved_company if resolved_company else _clean_entity_text(raw_subject, object_type)
     if object_type == "Company" and not _is_valid_company_name(object_name):
         return []
     if not _is_valid_memory_span(object_name):
@@ -679,13 +1771,19 @@ def _normalize_triple_candidate(*, user_id: str, message: str, source: str, trip
         confidence = 0.0
 
     object_type = str(triple.get("object_type") or "Entity").strip() or "Entity"
+    relation = str(triple.get("relation") or "RELATED_TO").strip() or "RELATED_TO"
+    object_name, object_type = _resolve_entity_type_and_name(
+        object_name=str(triple.get("object_name") or "").strip(),
+        object_type=object_type,
+        relation=relation,
+    )
     return TripleCandidate(
         user_id=user_id,
         subject_type=str(triple.get("subject_type") or "User").strip() or "User",
         subject_name=str(triple.get("subject_name") or user_id).strip() or user_id,
-        relation=str(triple.get("relation") or "RELATED_TO").strip() or "RELATED_TO",
+        relation=relation,
         object_type=object_type,
-        object_name=_clean_entity_text(str(triple.get("object_name") or "").strip(), object_type),
+        object_name=object_name,
         confidence=max(0.0, min(confidence, 1.0)),
         source=source,
         raw_text=message,
@@ -798,6 +1896,59 @@ def _heuristic_triple_candidates(*, user_id: str, message: str, source: str) -> 
                         object_type="Skill",
                         object_name=skill,
                         confidence=0.88,
+                        source=source,
+                        raw_text=message,
+                    )
+                )
+
+        focus_match = re.search(
+            r"(?:focusing on|focused on|currently focusing on|working through)\s+([a-zA-Z0-9 +#,\-]{2,80})",
+            clause,
+            flags=re.IGNORECASE,
+        )
+        if focus_match:
+            for object_name in _split_memory_objects(focus_match.group(1).strip(" ."), "Topic"):
+                if not _is_valid_memory_span(object_name):
+                    continue
+                triples.append(
+                    TripleCandidate(
+                        user_id=user_id,
+                        subject_type="User",
+                        subject_name=user_id,
+                        relation="STUDIES",
+                        object_type="Topic",
+                        object_name=object_name,
+                        confidence=0.84,
+                        source=source,
+                        raw_text=message,
+                        linked_to_action=True,
+                    )
+                )
+
+        difficulty_match = re.search(
+            r"([a-zA-Z0-9 +#,\-]{2,60})\s+(?:is|feels)\s+(?:a bit |kind of |quite )?(?:difficult|hard|confusing|tricky|tough)",
+            clause,
+            flags=re.IGNORECASE,
+        )
+        if not difficulty_match:
+            difficulty_match = re.search(
+                r"find\s+([a-zA-Z0-9 +#,\-]{2,60}?)(?:\s+(?:a bit|kind of|quite))?\s+(?:difficult|hard|confusing|tricky|tough)",
+                clause,
+                flags=re.IGNORECASE,
+            )
+        if difficulty_match:
+            for object_name in _split_memory_objects(difficulty_match.group(1).strip(" ."), "Skill"):
+                if not _is_valid_memory_span(object_name):
+                    continue
+                triples.append(
+                    TripleCandidate(
+                        user_id=user_id,
+                        subject_type="User",
+                        subject_name=user_id,
+                        relation="STRUGGLES_WITH",
+                        object_type="Skill",
+                        object_name=object_name,
+                        confidence=0.9,
                         source=source,
                         raw_text=message,
                     )
@@ -999,8 +2150,8 @@ def _extract_company_targets(text: str) -> list[str]:
     ]
     for pattern in patterns:
         for match in re.finditer(pattern, text):
-            company = _clean_entity_text(match.group(1).strip(" ."), "Company")
-            if _is_valid_company_name(company):
+            company = _resolve_company_name(match.group(1).strip(" ."))
+            if company and _is_valid_company_name(company):
                 candidates.append(company)
     deduped: list[str] = []
     seen: set[str] = set()
@@ -1024,6 +2175,66 @@ def _is_valid_company_name(text: str) -> bool:
     if len(cleaned.split()) > 3:
         return False
     return True
+
+
+def _resolve_entity_type_and_name(*, object_name: str, object_type: str, relation: str) -> tuple[str, str]:
+    cleaned_type = object_type.strip() or "Entity"
+    cleaned_name = _clean_entity_text(object_name, cleaned_type)
+    relation_key = relation.strip().upper()
+    should_try_company = (
+        cleaned_type.lower() == "company"
+        or relation_key in {"TARGETS", "INTERVIEWED_AT"}
+        or bool(re.search(r"\binterview\b", cleaned_name, flags=re.IGNORECASE))
+    )
+    if should_try_company:
+        resolved_company = _resolve_company_name(cleaned_name)
+        if resolved_company:
+            return resolved_company, "Company"
+    return cleaned_name, cleaned_type
+
+
+def _resolve_company_name(text: str) -> str | None:
+    cleaned = re.sub(r"\s+", " ", (text or "").strip(" .,\t\r\n"))
+    if not cleaned:
+        return None
+    cache_key = cleaned.lower()
+    if cache_key in _COMPANY_CLASSIFICATION_CACHE:
+        return _COMPANY_CLASSIFICATION_CACHE[cache_key]
+
+    prompt = f"""
+Decide whether the given text refers to a real company or organization.
+Return strict JSON only with this exact shape:
+{{
+  "is_company": true,
+  "company_name": "Microsoft"
+}}
+
+Rules:
+- If the text includes extra context like interview, role, job, or preparation, extract only the company name when it is clearly a company.
+- If the text is a topic, domain, skill, exam, field, or generic phrase, return is_company=false and company_name="".
+- company_name must be short and atomic.
+- Do not guess when unsure.
+
+Text: {cleaned}
+""".strip()
+
+    resolved: str | None = None
+    try:
+        client = _get_client()
+        response = client.models.generate_content(
+            model=SIGNAL_MODEL,
+            contents=prompt,
+        )
+        payload = _parse_semantic_response(response.text or "")
+        if bool(payload.get("is_company")):
+            candidate = _clean_entity_text(str(payload.get("company_name") or "").strip(), "Company")
+            if _is_valid_company_name(candidate):
+                resolved = candidate
+    except Exception:
+        resolved = None
+
+    _COMPANY_CLASSIFICATION_CACHE[cache_key] = resolved
+    return resolved
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
