@@ -1,0 +1,239 @@
+pages 8
+--- PAGE 1 ---
+Team Name:   Code catalyst                  
+Team Leader: Siddhi Sapkal
+Problem statement:GraphMind: User-Centric Long-Term
+Memory Mindmap + Hybrid RAG Assistant  
+Problem ID: 1
+University/College name: Cummins College of Engineering,
+Pune 
+Track:  Expert
+
+--- PAGE 2 ---
+Problem Statement:
+Current AI assistants are largely stateless and
+rely primarily on chat logs or embedding-
+based retrieval. They:
+Fail to maintain structured long-term
+memory per user
+Cannot explain why a specific answer
+was generated
+Struggle to scale memory without chaos
+Retrieve information inefficiently as data
+grows
+Lack strict user-level memory isolation
+Proposed Solution:
+We propose GraphMind, a user-centric AI
+assistant that:
+Builds a structured, evolving graph
+memory per user
+Stores facts, entities, events, preferences,
+and relationships
+Uses hybrid retrieval (Graph traversal +
+optional vector search)
+Generates explainable, evidence-backed
+responses
+Displays real-time retrieval performance
+GraphMind transforms conversations into
+structured intelligence instead of temporary
+chat history.
+
+--- PAGE 3 ---
+Approach/Method
+A) User-Scoped Two-Layer Memory Model:
+Each user has an independent cognitive memory
+space:
+Ephemeral Layer (Short-Term)
+ • Stores raw interaction signals
+ • Unverified entities, topics, preferences
+ • TTL-based & reinforcement-driven
+ • Filtered via transformer-based semantic
+scoring
+Consolidated Graph Memory (Long-Term –
+Neo4j)
+ • Stores validated knowledge only
+ • Nodes: User, Entity, Fact, Preference, Event,
+Goal, DocumentChunk
+ • Edges: MENTIONS, RELATED_TO, PREFERS,
+WORKS_ON, HAPPENED_AT, DERIVED_FROM,
+CONFIRMS, CONTRADICTS
+Retrieval Rules:
+ • Anchored at User
+ • ≤ 3-hop traversal
+ • Strict user isolation
+B) Controlled Memory Ingestion & Promotion
+Pipeline:
+Extract → Score → Assign Metadata → Temporary
+Store → Conditional Promotion
+Promotion occurs only if:
+ • Reinforced multiple times
+ • High semantic importance
+ • Linked to concrete action
+Graph updates use MERGE normalization with
+incremental updates to confidence & last_reinforced.
+Prevents graph explosion while enabling structured
+evolution.
+C) Graph-First Hybrid Retrieval Strategy:
+Deterministic retrieval pipeline:
+1.User-anchored graph traversal (primary retrieval)
+2.Optional vector similarity search (Milvus) for long-
+form content
+3.Context assembly: ranked nodes + evidence +
+source references
+Graph = Source of Truth
+ Vector DB = Semantic Enrichment
+
+--- PAGE 4 ---
+1. Confidence & Reinforcement-Based Memory
+Each memory node tracks confidence,
+reinforcement count, and recency, allowing
+knowledge to strengthen through repeated use and
+decay when unused.
+2. Contradiction-Aware Knowledge Storage
+Conflicting facts are preserved and explicitly linked
+rather than overwritten, enabling transparent
+reasoning and historical traceability.
+3.Deterministic & Explainable Retrieval
+Every response is grounded in retrieved memory
+nodes, with clear evidence paths and relevance
+scores, eliminating black-box behavior.
+4. Precomputed Intelligence Cache
+Frequently used insights such as high-confidence
+concepts, trends, and summaries are computed
+asynchronously and cached for fast retrieval.
+5. Bounded & Predictable Query Performance
+User-anchored traversal with strict depth limits
+ensures consistent performance as memory grows.
+6. Hybrid Structured + Semantic Memory
+Structured knowledge is stored in the graph, while
+semantic embeddings are used only for long-form
+text retrieval, preventing semantic noise.
+7. Memory Audit & User-Governed Control
+Users can inspect stored memories, view their
+provenance and reinforcement history, and
+selectively correct or delete entries to maintain
+accuracy and trust.
+Key Features : GraphMind Memory Engine
+
+--- PAGE 5 ---
+WorkflowInterview Preperation Usecase
+S T A R T
+U S E R  I N P U T
+ C H A T  U I
+V S  C O D E  E X T E N S I O N
+C O M P A N Y  S E L E C T I O N
+B O O K  U P L O A D
+A U D I O  R E C O R D I N G
+T E X T  E X T R A C T I O N
+T R A N S F O R M E R
+S E M A N T I C  S C O R I N G
+T R A C K :  T I M E ,  E R R O R S ,
+A T T E M P T S
+C H U N K I N G  +
+E M B E D D I N G
+S P E E C H - T O - T E X T
+N L P  A N A L Y S I S
+F E T C H  H I R I N G  F O C U S
+M E M O R Y  I N G E S T I O N  P I P E L I N E
+E X T E R N A L
+I N P U T S
+( N E W S  A P I S
+/  W E B
+S O U R C E S )
+M E M O R Y  G A T I N G  E N G I N E
+E P H E M E R A L  M E M O R Y  L A Y E R
+ ↓
+R U L E - B A S E D  P R O M O T I O N  L O G I C
+N E O 4 J  ( S T R U C T U R E D  G R A P H
+M E M O R Y )
+M I L V U S  ( V E C T O R  T E X T  M E M O R Y )
+L O N G - T E R M  M E M O R Y  S T O R A G E
+P R E C O M P U T E D  I N T E L L I G E N C E
+L A Y E R
+B A C K G R O U N D  W O R K E R S
+↓
+I N S I G H T  G E N E R A T I O N
+↓
+C A C H E  S T O R A G E M I L V U S  ( V E C T O R
+T E X T  M E M O R Y )
+Q U E R Y  &  R E T R I E V A L
+L L M  G E N E R A T E S  G R O U N D E D  R E S P O N S E
+M E M O R Y  C I T A T I O N S
+R E T R I E V A L  T I M E
+I N S I G H T  F E E D  ( A U T O - G E N E R A T E D )
+P R E C O M P U T E D
+ R A N K E D  B Y  I M P O R T A N C E
+ U P D A T E D  A U T O M A T I C A L L Y
+ U S E R  I N T E R F A C E
+Frontend
+React
+TypeScript (VS Code
+Extension)
+Backend
+FastAPI
+REST APIs
+Asynchronous Workers
+Memory & Storage
+Neo4j
+Milvus
+Redis
+AI & Machine Learning
+Transformer Models
+Large Language Models (LLMs)
+Speech & Language Processing
+Speech-to-Text
+Natural Language Processing
+(NLP)
+External Data
+News API
+Technologies
+
+--- PAGE 6 ---
+Results/Expected Outcome
+Prototype UI View and Video     
+Link of video:
+https://drive.google.com/drive/fol
+ders/1YtbMzlCJjiQ12D1uzj539jlY1
+709gBTk?usp=drive_link
+
+--- PAGE 7 ---
+Enhancements(Beyond Basic)
+1.Real-Time Coding Behavior Tracking
+A VS Code extension continuously captures coding
+behavior such as time spent, errors, edits, and stuck
+time, enabling fine-grained understanding of
+problem-solving patterns.
+2. Adaptive Question & Difficulty Engine
+Practice questions and hints dynamically adapt
+based on mastery score, improvement velocity, and
+recent performance instead of fixed difficulty levels.
+3. Communication Skill Intelligence
+Speech recordings are analyzed for confidence,
+filler words, grammar, and pacing, with improvement
+trends tracked across sessions and linked to
+interview readiness.
+4.Company-Aware Readiness Analysis
+Company hiring focus is mapped directly to user
+weaknesses to compute a Company Readiness
+Score, highlighting high-risk topics for targeted
+preparation.
+5.Current Affairs & Context Awareness
+News articles are ingested, classified by
+policy/domain relevance, and linked to preparation
+topics, supporting HR and civil-services-style
+interviews.
+6.Insight Feed with Actionable Signals
+The system surfaces high-impact insights such as
+repeated weaknesses, improvement milestones,
+and preparation priorities instead of raw data.
+.
+
+--- PAGE 8 ---
+NAME ROLE YEAR BRANCH EMAIL ID
+       Vidisha Thool      Student   Third Year           Entc vidisha.thool@cumminscollege.i
+n
+      Siddhi Sapkal      Student   Third Year           Entc siddhisapkal122@gmail.com
+       Aditi Phalake      Student   Third Year           Entc aditi.phalake@cumminscollege.i
+n
+       Sayli Hirkar      Student   Third Year           Entc sayli.hirkar@cumminscollege.in
+Team Description:
