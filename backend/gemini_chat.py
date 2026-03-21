@@ -51,6 +51,7 @@ COMPANY_STOPWORDS = {
 }
 CACHE_VERSION = "v3"
 _COMPANY_CLASSIFICATION_CACHE: dict[str, str | None] = {}
+_ENTITY_CLASSIFICATION_CACHE: dict[str, tuple[str, str] | None] = {}
 
 
 def _extraction_cache_path() -> Path:
@@ -261,6 +262,22 @@ def generate_reply_bundle(
         joined = "\n".join(f"- {fact}" for fact in compact_web)
         web_block = f"\nLive web findings:\n{joined}\n"
 
+    reply_style = ""
+    if memory_found:
+        reply_style = """
+Reply format:
+- First paragraph: if the supplied memory is genuinely relevant, briefly connect the answer to that memory in a natural way.
+- Second paragraph: give the general explanation, guidance, or answer the user needs.
+- Keep it clean, warm, and direct. Do not sound robotic.
+""".strip()
+    else:
+        reply_style = """
+Reply format:
+- Start by clearly saying that this question does not appear related to the relevant saved memory you found.
+- Then answer the question from general knowledge in a separate paragraph.
+- If live web findings are not already provided, end with one short line offering web search, for example: "If you want, I can search the web for this too."
+""".strip()
+
     prompt = f"""Answer using only the supplied memory and optional web findings.
 Be concise, practical, and specific.
 Prefer short answers unless the user asks for depth.
@@ -272,6 +289,7 @@ Do not repeat the memory back verbatim unless it materially improves the answer.
 If relevant memory is not provided, answer from general knowledge without mentioning missing memory, lacking memory, recent conversation analysis, or unsupported preparation claims.
 Never claim the user is preparing for, weak in, or related to a topic unless that is directly supported by the supplied memory.
 Do not stitch unrelated topics together just because they appeared earlier in the conversation.
+{reply_style}
 {graph_block}
 {web_block}
 {evidence_block}
@@ -288,7 +306,7 @@ Assistant:"""
                 temperature=0.2,
                 max_tokens=REPLY_MAX_TOKENS,
                 messages=[
-                    {"role": "system", "content": "Use provided memory only when it is directly relevant. If memory is absent or weak, answer from general knowledge. Do not invent user facts or preparation claims."},
+                    {"role": "system", "content": "Use provided memory only when it is directly relevant. If memory is absent or weak, answer from general knowledge. Do not invent user facts or preparation claims. When memory is relevant, use a short memory-aware first paragraph and then a general-answer second paragraph. When memory is not relevant, say that clearly first, then answer generally, and if web findings are absent you may offer web search in one short final line."},
                     {"role": "user", "content": prompt},
                 ],
             )
@@ -323,6 +341,59 @@ def configured_models() -> dict[str, str]:
         "chat_model": CHAT_MODEL,
         "signal_model": SIGNAL_MODEL,
         "embed_model": EMBED_MODEL,
+    }
+
+
+def evaluate_response_relevance(*, query: str, response: str) -> dict[str, object]:
+    cleaned_query = " ".join((query or "").split()).strip()
+    cleaned_response = " ".join((response or "").split()).strip()
+    if not cleaned_query or not cleaned_response:
+        return {"score": 1, "reason": "Missing query or response."}
+
+    prompt = f"""
+Query: {cleaned_query}
+Response: {cleaned_response}
+
+Rate the relevance of the response to the query on a scale of 1 to 5.
+1 = Not relevant
+5 = Highly relevant
+
+Return strict JSON only with this exact shape:
+{{
+  "score": 4,
+  "reason": "Response addresses the query but misses some specifics."
+}}
+
+Rules:
+- Judge only whether the response answers the query.
+- Keep reason brief and concrete.
+- score must be an integer from 1 to 5.
+""".strip()
+
+    try:
+        client = _get_client()
+        response_obj = client.models.generate_content(
+            model=SIGNAL_MODEL,
+            contents=prompt,
+        )
+        payload = _parse_semantic_response(response_obj.text or "")
+        score = int(payload.get("score") or 0)
+        reason = str(payload.get("reason") or "").strip()
+        if 1 <= score <= 5:
+            return {
+                "score": score,
+                "reason": reason or "Relevance judged by LLM.",
+            }
+    except Exception:
+        pass
+
+    query_tokens = set(re.findall(r"\w+", cleaned_query.lower()))
+    response_tokens = set(re.findall(r"\w+", cleaned_response.lower()))
+    overlap = len(query_tokens & response_tokens)
+    fallback_score = 5 if overlap >= 5 else 4 if overlap >= 3 else 3 if overlap >= 1 else 2
+    return {
+        "score": fallback_score,
+        "reason": "Fallback relevance estimate based on query-response overlap.",
     }
 
 
@@ -423,6 +494,13 @@ Instructions:
 - Resolve references like "it", "this"
 - Subject is always User({user_id})
 - Object must be short and atomic
+- Preserve legitimate compound topic names such as course names, subject names, or standard phrases. Do not split a real topic just because it contains "and".
+- When the message mentions a broad subject, a subtopic inside it, and an underlying prerequisite weakness, capture all of them if they are durable.
+- If the user says they struggle in subtopic X inside subject Y because of weakness Z, prefer:
+  - a user fact for the broad subject if they are studying it
+  - a user fact for the subtopic they struggle with
+  - a user fact for the underlying weak prerequisite
+  - and concept relations such as X PART_OF Y or X DEPENDS_ON Z when appropriate
 - Do NOT include full sentences
 - Do NOT extract meaningless data
 - Prefer Topic, Skill, Goal, Company, Domain, Concept, Entity, or Document as object_type
@@ -444,6 +522,21 @@ Output STRICT JSON:
     }}
   ],
   "concept_relations": []
+}}
+
+Example:
+User message: "In Signals and Systems, I struggle in Fourier Transform because I am weak in integration."
+Good extraction:
+{{
+  "user_facts": [
+    {{"relation":"STUDIES","object_type":"Topic","object_name":"Signals and Systems","confidence":0.88,"linked_to_action":true}},
+    {{"relation":"STRUGGLES_WITH","object_type":"Topic","object_name":"Fourier Transform","confidence":0.9,"linked_to_action":true}},
+    {{"relation":"STRUGGLES_WITH","object_type":"Skill","object_name":"Integration","confidence":0.86,"linked_to_action":true}}
+  ],
+  "concept_relations": [
+    {{"subject_type":"Topic","subject_name":"Fourier Transform","relation":"PART_OF","object_type":"Topic","object_name":"Signals and Systems","confidence":0.83}},
+    {{"subject_type":"Topic","subject_name":"Fourier Transform","relation":"DEPENDS_ON","object_type":"Skill","object_name":"Integration","confidence":0.8}}
+  ]
 }}
 
 User message: {message}
@@ -675,6 +768,7 @@ def analyze_strength_weakness_profile(
     triples: list[TripleCandidate] | None = None,
     web_facts: list[str] | None = None,
     seed_observations: list[dict[str, object]] | None = None,
+    existing_profile_summary: dict[str, list[dict[str, object]]] | None = None,
 ) -> list[dict[str, object]]:
     compact_triples = [
         {
@@ -701,18 +795,19 @@ def analyze_strength_weakness_profile(
         for item in list(seed_observations or [])[:8]
         if isinstance(item, dict) and str(item.get("entity") or "").strip()
     ]
+    compact_existing_profile = _compact_profile_summary(existing_profile_summary)
     prompt = f"""
 Analyze the user's message and classify any self-assessment into strengths, weaknesses, and improving areas.
 Return strict JSON only with this exact shape:
 {{
   "strengths": [
-    {{"entity": "Problem Solving", "entity_type": "Skill", "delta": 0.8, "rationale": "user says they are good at it"}}
+    {{"entity": "Problem Solving", "entity_type": "Skill", "delta": 0.8, "update_mode": "reinforce", "rationale": "user says they are good at it"}}
   ],
   "weaknesses": [
-    {{"entity": "Dynamic Programming", "entity_type": "Skill", "delta": 0.9, "rationale": "user says it is challenging"}}
+    {{"entity": "Dynamic Programming", "entity_type": "Skill", "delta": 0.9, "update_mode": "reinforce", "rationale": "user says it is challenging"}}
   ],
   "improving": [
-    {{"entity": "Timed Coding Rounds", "entity_type": "Skill", "delta": 0.7, "rationale": "user is actively working on it"}}
+    {{"entity": "Timed Coding Rounds", "entity_type": "Skill", "delta": 0.7, "update_mode": "reinforce", "rationale": "user is actively working on it"}}
   ]
 }}
 
@@ -724,6 +819,9 @@ Rules:
 - Use `weaknesses` for areas the user says are challenging, weak, difficult, confusing, or where they struggle.
 - Use `improving` for areas the user says they are currently practicing, improving, working on, or building confidence in.
 - The same entity can appear in both `weaknesses` and `improving` if the user implies both.
+- update_mode must be one of: reinforce, replace_opposite
+- Use replace_opposite when the new message clearly updates or overturns an older personal profile state for the same skill.
+- Existing profile summary contains older user-profile statements, not universal truths. Only use replace_opposite when the new message is clearly a newer self-update.
 - Use the web context only to disambiguate the topic, not to invent signals.
 - If the user clearly gives self-assessment, do not return empty arrays for everything.
 
@@ -732,6 +830,9 @@ Extracted user triples:
 
 Preliminary observations:
 {json.dumps(compact_seed, ensure_ascii=True)}
+
+Existing profile summary:
+{json.dumps(compact_existing_profile, ensure_ascii=True)}
 
 Relevant web context:
 {json.dumps(compact_web, ensure_ascii=True)}
@@ -758,6 +859,7 @@ User message:
                 message=message,
                 candidates=candidates,
                 web_facts=compact_web,
+                existing_profile_summary=compact_existing_profile,
             )
             filtered_classified = _filter_profile_observations(classified)
             if filtered_classified:
@@ -809,6 +911,103 @@ User message:
         if existing is None or float(item.get("delta") or 0.0) > float(existing.get("delta") or 0.0):
             deduped[key] = item
     return list(deduped.values())
+
+
+def classify_profile_graph_signals(
+    *,
+    message: str,
+    observations: list[dict[str, object]],
+    web_facts: list[str] | None = None,
+) -> list[dict[str, object]]:
+    compact_observations = [
+        {
+            "entity": str(item.get("entity") or "").strip(),
+            "entity_type": str(item.get("entity_type") or "Skill").strip() or "Skill",
+            "signal_type": str(item.get("signal_type") or "").strip().lower(),
+            "delta": float(item.get("delta") or 0.0),
+        }
+        for item in list(observations or [])[:10]
+        if isinstance(item, dict) and str(item.get("entity") or "").strip()
+    ]
+    compact_web = [
+        " ".join(str(item or "").split()).strip()
+        for item in list(web_facts or [])[:5]
+        if str(item or "").strip()
+    ]
+    if not compact_observations:
+        return []
+
+    prompt = f"""
+Decide which profile observations are durable enough to also store in graph memory.
+Return strict JSON only with this exact shape:
+{{
+  "signals": [
+    {{
+      "entity": "DBMS",
+      "entity_type": "Skill",
+      "relation": "STRENGTH_IN",
+      "confidence": 0.86,
+      "reason": "clear durable strength from user self-assessment"
+    }}
+  ]
+}}
+
+Rules:
+- Allowed relations are only: STRENGTH_IN, STRUGGLES_WITH, IMPROVING_IN
+- Use only the provided observations as candidates
+- Store only durable user profile facts that make sense in graph memory
+- Keep entity atomic and clean
+- Ignore anything vague or weakly supported by the message
+- Use the web context only to understand whether the topic is relevant, not to invent new entities
+
+Profile observations:
+{json.dumps(compact_observations, ensure_ascii=True)}
+
+Relevant web context:
+{json.dumps(compact_web, ensure_ascii=True)}
+
+User message:
+{message}
+""".strip()
+
+    try:
+        client = _get_client()
+        response = client.models.generate_content(
+            model=SIGNAL_MODEL,
+            contents=prompt,
+        )
+        payload = _parse_semantic_response(response.text or "")
+    except Exception:
+        return []
+
+    signals: list[dict[str, object]] = []
+    for item in list(payload.get("signals") or []):
+        if not isinstance(item, dict):
+            continue
+        entity = _clean_profile_entity_text(
+            str(item.get("entity") or "").strip(),
+            str(item.get("entity_type") or "Skill").strip() or "Skill",
+        )
+        entity_type = str(item.get("entity_type") or "Skill").strip() or "Skill"
+        relation = str(item.get("relation") or "").strip().upper()
+        if relation not in {"STRENGTH_IN", "STRUGGLES_WITH", "IMPROVING_IN"}:
+            continue
+        if not _is_useful_profile_entity(entity):
+            continue
+        try:
+            confidence = float(item.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        signals.append(
+            {
+                "entity": entity,
+                "entity_type": entity_type,
+                "relation": relation,
+                "confidence": max(0.6, min(confidence or 0.8, 0.98)),
+                "linked_to_action": True,
+            }
+        )
+    return signals
 
 
 def _normalize_string_list(value: object, *, fallback: list[str]) -> list[str]:
@@ -1178,6 +1377,7 @@ def _extract_bucketed_profile_observations_with_gemini(*, client: genai.Client, 
             entity = str(item.get("entity") or "").strip()
             entity_type = str(item.get("entity_type") or "Skill").strip() or "Skill"
             rationale = str(item.get("rationale") or "").strip()
+            update_mode = str(item.get("update_mode") or "reinforce").strip().lower()
             try:
                 delta = float(item.get("delta") or 0.0)
             except (TypeError, ValueError):
@@ -1191,6 +1391,7 @@ def _extract_bucketed_profile_observations_with_gemini(*, client: genai.Client, 
                     "entity_key": normalize_text_key(entity),
                     "signal_type": signal_type,
                     "delta": max(-1.5, min(delta, 1.5)),
+                    "update_mode": update_mode if update_mode in {"reinforce", "replace_opposite"} else "reinforce",
                     "rationale": rationale,
                 }
             )
@@ -1203,6 +1404,7 @@ def _classify_profile_candidates_with_gemini(
     message: str,
     candidates: list[str],
     web_facts: list[str] | None = None,
+    existing_profile_summary: dict[str, list[dict[str, object]]] | None = None,
 ) -> list[dict[str, object]]:
     prompt = f"""
 Classify whether each candidate topic from the user's message should count as a strength, weakness, improving area, or be ignored.
@@ -1214,6 +1416,7 @@ Return strict JSON only with this exact shape:
       "entity_type": "Skill",
       "signal_type": "strength",
       "delta": 0.8,
+      "update_mode": "reinforce",
       "rationale": "user explicitly says they are strong in it"
     }}
   ]
@@ -1221,8 +1424,10 @@ Return strict JSON only with this exact shape:
 
 Rules:
 - signal_type must be one of: strength, weakness, improving, ignore
+- update_mode must be one of: reinforce, replace_opposite
 - Use ignore for vague, generic, or unsupported candidates.
 - Classify based on the user's wording first.
+- Use replace_opposite when the new message clearly updates an older opposite self-assessment for the same skill.
 - Use the web context only to understand whether the candidate is a relevant interview/preparation topic.
 - Do not invent candidates.
 - Keep entity short and atomic.
@@ -1232,6 +1437,9 @@ Candidates:
 
 Relevant web context:
 {json.dumps(list(web_facts or [])[:5], ensure_ascii=True)}
+
+Existing profile summary:
+{json.dumps(existing_profile_summary or {}, ensure_ascii=True)}
 
 User message:
 {message}
@@ -1248,6 +1456,7 @@ User message:
         entity = str(item.get("entity") or "").strip()
         entity_type = str(item.get("entity_type") or "Skill").strip() or "Skill"
         signal_type = str(item.get("signal_type") or "ignore").strip().lower()
+        update_mode = str(item.get("update_mode") or "reinforce").strip().lower()
         rationale = str(item.get("rationale") or "").strip()
         try:
             delta = float(item.get("delta") or 0.0)
@@ -1262,6 +1471,7 @@ User message:
                 "entity_key": normalize_text_key(entity),
                 "signal_type": signal_type,
                 "delta": max(-1.5, min(delta or 0.7, 1.5)),
+                "update_mode": update_mode if update_mode in {"reinforce", "replace_opposite"} else "reinforce",
                 "rationale": rationale or "candidate_classification",
             }
         )
@@ -1272,6 +1482,7 @@ def _message_has_self_assessment_cues(message: str) -> bool:
     lowered = " ".join((message or "").lower().split())
     patterns = (
         r"\bi am good at\b",
+        r"\bi am good in\b",
         r"\bi am strong in\b",
         r"\bi am confident in\b",
         r"\bi am comfortable with\b",
@@ -1296,7 +1507,7 @@ def _candidate_profile_entities_from_message(
     results: list[str] = []
     text = " ".join((message or "").split())
     cue_patterns = (
-        r"\b(?:i am|i'm)\s+(?:good at|strong in|confident in|comfortable with)\s+(.+?)(?:[.!]|$)",
+        r"\b(?:i am|i'm)\s+(?:good at|good in|strong in|confident in|comfortable with)\s+(.+?)(?:[.!]|$)",
         r"\b(?:i am|i'm)\s+(?:weak in|struggling with|working on|improving|actively improving)\s+(.+?)(?:[.!]|$)",
         r"\b(?:i find)\s+(.+?)\s+(?:challenging|difficult|hard|tricky)(?:[.!]|$)",
         r"\b(?:focusing on improving|aiming to become|building confidence in)\s+(.+?)(?:[.!]|$)",
@@ -1328,7 +1539,7 @@ def _self_assessment_fallback_observations(message: str) -> list[dict[str, objec
         return []
     observations: list[dict[str, object]] = []
     patterns = [
-        (r"\b(?:i am|i'm)\s+(?:good at|strong in|confident in|comfortable with)\s+(.+?)(?:[.!]|$)", "strength", 0.85),
+        (r"\b(?:i am|i'm)\s+(?:good at|good in|strong in|confident in|comfortable with)\s+(.+?)(?:[.!]|$)", "strength", 0.85),
         (r"\b(?:i am|i'm)\s+(?:weak in|struggling with)\s+(.+?)(?:[.!]|$)", "weakness", 0.9),
         (r"\b(?:i am|i'm)\s+(?:working on|improving|actively improving)\s+(.+?)(?:[.!]|$)", "improving", 0.78),
         (r"\b(?:i find)\s+(.+?)\s+(?:challenging|difficult|hard|tricky)(?:[.!]|$)", "weakness", 0.82),
@@ -1777,6 +1988,8 @@ def _normalize_triple_candidate(*, user_id: str, message: str, source: str, trip
         object_type=object_type,
         relation=relation,
     )
+    if relation.upper() == "TARGETS" and object_type.strip().lower() != "company":
+        relation = "STUDIES" if object_type.strip().lower() in {"topic", "skill", "domain", "concept", "entity"} else "PREPARING_FOR"
     return TripleCandidate(
         user_id=user_id,
         subject_type=str(triple.get("subject_type") or "User").strip() or "User",
@@ -2131,7 +2344,7 @@ def _split_memory_objects(raw_text: str, object_type: str) -> list[str]:
     if not cleaned:
         return []
 
-    parts = re.split(r"\s*(?:,| and | & )\s*", cleaned, flags=re.IGNORECASE)
+    parts = re.split(r"\s*(?:,|/| & )\s*", cleaned, flags=re.IGNORECASE)
     results: list[str] = []
     for part in parts:
         candidate = _clean_entity_text(part.strip(" .,"), object_type)
@@ -2181,16 +2394,68 @@ def _resolve_entity_type_and_name(*, object_name: str, object_type: str, relatio
     cleaned_type = object_type.strip() or "Entity"
     cleaned_name = _clean_entity_text(object_name, cleaned_type)
     relation_key = relation.strip().upper()
-    should_try_company = (
-        cleaned_type.lower() == "company"
-        or relation_key in {"TARGETS", "INTERVIEWED_AT"}
-        or bool(re.search(r"\binterview\b", cleaned_name, flags=re.IGNORECASE))
-    )
-    if should_try_company:
+    if cleaned_type.lower() == "company" or relation_key in {"TARGETS", "INTERVIEWED_AT"}:
+        classified = _classify_entity_with_gemini(cleaned_name)
+        if classified:
+            return classified
+    if bool(re.search(r"\binterview\b", cleaned_name, flags=re.IGNORECASE)):
         resolved_company = _resolve_company_name(cleaned_name)
         if resolved_company:
             return resolved_company, "Company"
     return cleaned_name, cleaned_type
+
+
+def _classify_entity_with_gemini(text: str) -> tuple[str, str] | None:
+    cleaned = re.sub(r"\s+", " ", (text or "").strip(" .,\t\r\n"))
+    if not cleaned:
+        return None
+    cache_key = cleaned.lower()
+    if cache_key in _ENTITY_CLASSIFICATION_CACHE:
+        return _ENTITY_CLASSIFICATION_CACHE[cache_key]
+
+    prompt = f"""
+Classify the text into the best entity type.
+Return strict JSON only with this exact shape:
+{{
+  "entity_type": "Company",
+  "entity_name": "Amazon"
+}}
+
+Allowed entity_type values:
+- Company
+- Topic
+- Skill
+- Goal
+- Domain
+- Concept
+- Entity
+
+Rules:
+- Use Company only for a real company or organization.
+- If it is not actually a company, do not return Company.
+- Keep entity_name short, clean, and atomic.
+- Remove wrapper phrasing and return the core thing.
+
+Text: {cleaned}
+""".strip()
+
+    resolved: tuple[str, str] | None = None
+    try:
+        client = _get_client()
+        response = client.models.generate_content(
+            model=SIGNAL_MODEL,
+            contents=prompt,
+        )
+        payload = _parse_semantic_response(response.text or "")
+        entity_type = str(payload.get("entity_type") or "").strip() or "Entity"
+        entity_name = _clean_entity_text(str(payload.get("entity_name") or "").strip(), entity_type)
+        if entity_name:
+            resolved = (entity_name, entity_type)
+    except Exception:
+        resolved = None
+
+    _ENTITY_CLASSIFICATION_CACHE[cache_key] = resolved
+    return resolved
 
 
 def _resolve_company_name(text: str) -> str | None:
@@ -2319,6 +2584,39 @@ def _clean_entity_text(entity: str, entity_type: str) -> str:
         return cleaned
 
     lowered_type = entity_type.strip().lower()
+    cleaned = re.sub(
+        r"^(?:i am|i'm)\s+(?:good at|strong in|confident in|comfortable with|working on|improving|actively improving|focused on|focusing on)\s+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip(" .,\t\r\n")
+    cleaned = re.sub(
+        r"^(?:i am|i'm)\s+(?:good in)\s+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip(" .,\t\r\n")
+    cleaned = re.sub(
+        r"^(?:to improve|improving|understanding|learning|working on|languages like|topics like|skills like)\s+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip(" .,\t\r\n")
+    cleaned = re.sub(
+        r"\b(?:in these areas|these areas|those areas|for interviews?|in coding interviews?)\b",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip(" .,\t\r\n")
+    cleaned = re.sub(r"\b(?:advanced data structures and algorithms)\b", "DSA", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bdata structures and algorithms\b", "DSA", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bproblem-solving\b", "problem solving", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bbasic programming and problem solving\b", "Programming Fundamentals", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bunderstanding core concepts in programming\b", "Programming Fundamentals", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\blogical thinking\b", "Logical Thinking", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\btimed coding rounds\b", "Timed Coding", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\badvanced dsa\b", "Advanced DSA", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .,\t\r\n")
     if lowered_type in {"topic", "concept"}:
         cleaned = re.sub(
             r"\b(today|tonight|now|currently|lately|recently|this week|this month)\b$",
@@ -2347,7 +2645,6 @@ def _is_valid_memory_span(text: str) -> bool:
         " currently ",
         " yesterday ",
         " recently ",
-        " and ",
         " but ",
         " because ",
         " improved ",

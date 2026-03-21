@@ -1154,7 +1154,6 @@ class GraphMemoryService:
             entity_type = str(record.get("entity_type") or "Entity")
             if not entity_key:
                 continue
-
             nodes[entity_key] = {
                 "id": entity_key,
                 "label": entity_name,

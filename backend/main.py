@@ -14,7 +14,7 @@ from .auth_store import AuthUser, authenticate_user, create_session, delete_sess
 from .chat_history_store import ensure_conversation, get_chat_history, list_conversations, save_message as save_chat_message
 from .db import get_session
 from .event_store import delete_user_events, log_promotions, log_raw_event, recent_raw_events
-from .gemini_chat import analyze_strength_weakness_profile, classify_relation_with_llm, configured_models, extract_triple_candidates, generate_company_planner, generate_reply_bundle
+from .gemini_chat import analyze_strength_weakness_profile, classify_profile_graph_signals, classify_relation_with_llm, configured_models, evaluate_response_relevance, extract_triple_candidates, generate_company_planner, generate_reply_bundle
 from .profile_store import delete_user_profile, fetch_profile_summary, upsert_profile_observations
 from .graph.service import graph_memory_service
 from .prompt_router import route_prompt
@@ -971,7 +971,7 @@ def chat_ui() -> str:
             </div>
             <div class="graphHint">Core entities only. Lower-signal metadata stays out of the graph view.</div>
             <div class="graphLegend">
-              <span class="legendDot"><i style="background:#f59e0b"></i>User</span>
+              <span class="legendDot"><i style="background:#facc15"></i>User</span>
               <span class="legendDot"><i style="background:#22c55e"></i>Skill</span>
               <span class="legendDot"><i style="background:#38bdf8"></i>Topic</span>
               <span class="legendDot"><i style="background:#a78bfa"></i>Company</span>
@@ -1017,7 +1017,7 @@ def chat_ui() -> str:
         <button class="iconBtn" id="closeGraphModal" type="button">Close</button>
       </div>
       <div class="graphLegend">
-        <span class="legendDot"><i style="background:#f59e0b"></i>User</span>
+        <span class="legendDot"><i style="background:#facc15"></i>User</span>
         <span class="legendDot"><i style="background:#38bdf8"></i>Topic</span>
         <span class="legendDot"><i style="background:#22c55e"></i>Skill</span>
         <span class="legendDot"><i style="background:#fb7185"></i>Goal</span>
@@ -1113,6 +1113,42 @@ def chat_ui() -> str:
   uidEl.textContent = 'guest';
   unameEl.textContent = 'guest';
   cidEl.textContent = convoId;
+
+  function relevanceStorageKey() {
+    return `graphmind_relevance_${userId || 'guest'}_${convoId || 'default'}`;
+  }
+
+  function loadRelevanceStats() {
+    try {
+      const raw = localStorage.getItem(relevanceStorageKey());
+      const parsed = raw ? JSON.parse(raw) : null;
+      if (!parsed || !Array.isArray(parsed.scores)) return { scores: [] };
+      return {
+        scores: parsed.scores
+          .map((value) => Number(value))
+          .filter((value) => Number.isFinite(value))
+          .slice(-100)
+      };
+    } catch (e) {
+      return { scores: [] };
+    }
+  }
+
+  function saveRelevanceScore(score) {
+    const numeric = Number(score);
+    if (!Number.isFinite(numeric)) return;
+    const stats = loadRelevanceStats();
+    stats.scores.push(numeric);
+    localStorage.setItem(relevanceStorageKey(), JSON.stringify({ scores: stats.scores.slice(-100) }));
+  }
+
+  function clearRelevanceStats() {
+    localStorage.removeItem(relevanceStorageKey());
+  }
+
+  function relevancePercent(score) {
+    return Math.round((Number(score || 0) / 5) * 100);
+  }
 
   function setAuthState(payload) {
     const user = payload?.user || null;
@@ -1619,14 +1655,24 @@ def chat_ui() -> str:
     const route = data?.route?.intent || 'unknown';
     const topic = data?.topic_match?.topic || '';
     const provider = data?.llm_provider || 'unknown';
+    const memoryUpdateMode = data?.memory_update_mode || 'inline';
+    const relevance = data?.answer_relevance || null;
+    const relevanceStats = loadRelevanceStats();
+    const avgRelevance = relevanceStats.scores.length
+      ? (relevanceStats.scores.reduce((sum, value) => sum + value, 0) / relevanceStats.scores.length)
+      : 0;
     llmLabel.textContent = provider;
     llmDisplay.textContent = provider;
-    const headline = promoted > 0
+    const headline = memoryUpdateMode === 'background'
+      ? `Memory update queued in background.`
+      : promoted > 0
       ? `Memory updated with ${promoted} promoted item${promoted === 1 ? '' : 's'}.`
       : signals > 0
         ? `Signals detected and kept ready for reinforcement.`
         : `No major memory change from this turn.`;
-    const supporting = graphFacts > 0
+    const supporting = memoryUpdateMode === 'background'
+      ? `Answer returned first. Memory promotion will finish asynchronously and refresh shortly.`
+      : graphFacts > 0
       ? `Answer grounded with ${graphFacts} graph fact${graphFacts === 1 ? '' : 's'} and ${retrieved} retrieved snippet${retrieved === 1 ? '' : 's'}.`
       : `Route: ${route.replaceAll('_', ' ')}.` + (topic ? ` Focus: ${topic}.` : '');
     const tags = [
@@ -1635,12 +1681,14 @@ def chat_ui() -> str:
       `<span class="tag">retrieved ${retrieved}</span>`,
       `<span class="tag mutedTag">${route.replaceAll('_', ' ')}</span>`
     ];
+    if (relevanceStats.scores.length) tags.unshift(`<span class="tag">avg ${avgRelevance.toFixed(1)}/5 (${relevancePercent(avgRelevance)}%)</span>`);
+    if (relevance?.score) tags.unshift(`<span class="tag">relevance ${relevance.score}/5 (${relevancePercent(relevance.score)}%)</span>`);
     if (topic) tags.unshift(`<span class="tag">${topic}</span>`);
     summary.innerHTML = `
       <div class="summaryHero">
         <div>
           <b>${headline}</b>
-          <span>${supporting}</span>
+          <span>${supporting}${relevance?.reason ? ' Relevance: ' + escapeXml(relevance.reason) : ''}${relevanceStats.scores.length ? ' Running average till now: ' + avgRelevance.toFixed(1) + '/5 (' + relevancePercent(avgRelevance) + '%).' : ''}</span>
         </div>
         <div class="summaryStats">${tags.join('')}</div>
       </div>
@@ -1662,7 +1710,7 @@ def chat_ui() -> str:
 
   function colorForType(type) {
     const key = String(type || '').toLowerCase();
-    if (key === 'user') return '#f59e0b';
+    if (key === 'user') return '#facc15';
     if (key === 'company') return '#a78bfa';
     if (key === 'goal') return '#fb7185';
     if (key === 'skill') return '#22c55e';
@@ -1979,6 +2027,7 @@ def chat_ui() -> str:
     if (!userId) return;
     convoId = "convo-" + rand();
     localStorage.setItem('graphmind_convo_id', convoId);
+    clearRelevanceStats();
     cidEl.textContent = convoId;
     msgs.innerHTML = '<div class="msg bot">New conversation started. What are you working on now?</div>';
     loadConversationList();
@@ -2060,8 +2109,10 @@ def chat_ui() -> str:
       if (!res.ok) {
         throw new Error(data?.detail || 'Chat request failed.');
       }
+      if (data?.answer_relevance?.score) {
+        saveRelevanceScore(data.answer_relevance.score);
+      }
       if (!data?.memory_found && !data?.web_search_used) {
-        add('I could not find anything relevant in your memory for that yet.', 'bot');
         if (data?.answer) {
           add(data.answer, 'bot');
         }
@@ -2083,9 +2134,11 @@ def chat_ui() -> str:
       const graphRetrievalMs = data?.graph_retrieval_time_ms ?? 0;
       const graphPromotionMs = data?.graph_promotion_time_ms ?? 0;
       const llmMs = data?.llm_generation_time_ms ?? 0;
+      const relevanceMs = data?.answer_relevance_time_ms ?? 0;
       const extractionMs = data?.signal_extraction_time_ms ?? 0;
       const webMs = data?.web_retrieval_time_ms ?? 0;
-      latEl.textContent = 'Response ' + totalMs + ' ms | LLM ' + llmMs + ' ms | Extract ' + extractionMs + ' ms | Graph ' + graphRetrievalMs + ' ms | Promotion ' + graphPromotionMs + ' ms | Vector ' + retrievalMs + ' ms | Web ' + webMs + ' ms';
+      const promotionText = (data?.memory_update_mode === 'background') ? 'queued' : (graphPromotionMs + ' ms');
+      latEl.textContent = 'Response ' + totalMs + ' ms | LLM ' + llmMs + ' ms | Judge ' + relevanceMs + ' ms | Extract ' + extractionMs + ' ms | Graph ' + graphRetrievalMs + ' ms | Promotion ' + promotionText + ' | Vector ' + retrievalMs + ' ms | Web ' + webMs + ' ms';
     } catch (e) {
       console.error(e);
       add(e.message || 'Server error. Check backend logs.', 'bot');
@@ -2418,6 +2471,7 @@ def _process_memory_pipeline(
     created_at: str,
     inferred_raw_signals: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
+    existing_profile_summary = fetch_profile_summary(user_id=user_id, limit=8)
     extracted_triples = extract_triple_candidates(
         user_id=user_id,
         message=message,
@@ -2426,6 +2480,7 @@ def _process_memory_pipeline(
     base_profile_observations = analyze_strength_weakness_profile(
         message=message,
         triples=extracted_triples,
+        existing_profile_summary=existing_profile_summary,
     )
     profile_web_facts = _profile_signal_web_facts(
         message=message,
@@ -2437,12 +2492,33 @@ def _process_memory_pipeline(
         triples=extracted_triples,
         web_facts=profile_web_facts,
         seed_observations=base_profile_observations,
+        existing_profile_summary=existing_profile_summary,
     ) or base_profile_observations
     if profile_observations:
         upsert_profile_observations(
             user_id=user_id,
             observations=profile_observations,
         )
+    profile_graph_signals = classify_profile_graph_signals(
+        message=message,
+        observations=profile_observations,
+        web_facts=profile_web_facts,
+    )
+    profile_raw_signals = [
+        {
+            "user_id": user_id,
+            "entity": str(item.get("entity") or "").strip(),
+            "entity_type": str(item.get("entity_type") or "Skill").strip() or "Skill",
+            "relation": str(item.get("relation") or "").strip(),
+            "confidence": float(item.get("confidence") or 0.8),
+            "linked_to_action": bool(item.get("linked_to_action")),
+            "source": "profile_graph_classifier",
+            "raw_text": message,
+            "source_event_id": source_event_id,
+        }
+        for item in profile_graph_signals
+        if str(item.get("entity") or "").strip() and str(item.get("relation") or "").strip()
+    ]
     profile_summary = fetch_profile_summary(user_id=user_id, limit=5)
     extracted_raw_signals = [
         {
@@ -2459,7 +2535,7 @@ def _process_memory_pipeline(
         for triple in extracted_triples
         if triple.subject_type.strip().lower() == "user"
     ]
-    all_raw_signals = [*extracted_raw_signals, *(inferred_raw_signals or [])]
+    all_raw_signals = [*extracted_raw_signals, *profile_raw_signals, *(inferred_raw_signals or [])]
 
     with get_session() as session:
         promotion_summary = {"ephemeral_count": 0, "promoted_count": 0, "promoted_items": []}
@@ -2479,6 +2555,19 @@ def _process_memory_pipeline(
                 "promoted_items": [
                     *list(promotion_summary.get("promoted_items") or []),
                     *list(inferred_summary.get("promoted_items") or []),
+                ],
+            }
+        if profile_raw_signals:
+            profile_summary_result = graph_memory_service.process_signals(
+                session=session,
+                raw_signals=profile_raw_signals,
+            )
+            promotion_summary = {
+                "ephemeral_count": int(promotion_summary.get("ephemeral_count") or 0) + int(profile_summary_result.get("ephemeral_count") or 0),
+                "promoted_count": int(promotion_summary.get("promoted_count") or 0) + int(profile_summary_result.get("promoted_count") or 0),
+                "promoted_items": [
+                    *list(promotion_summary.get("promoted_items") or []),
+                    *list(profile_summary_result.get("promoted_items") or []),
                 ],
             }
         if int(promotion_summary.get("promoted_count") or 0) > 0:
@@ -2516,6 +2605,30 @@ def _process_memory_pipeline(
         "profile_summary": profile_summary,
         "profile_web_facts": profile_web_facts,
     }
+
+
+def _run_memory_pipeline_background(
+    *,
+    user_id: str,
+    conversation_id: str,
+    message: str,
+    source: str,
+    source_event_id: str,
+    created_at: str,
+    inferred_raw_signals: list[dict[str, object]] | None = None,
+) -> None:
+    try:
+        _process_memory_pipeline(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            message=message,
+            source=source,
+            source_event_id=source_event_id,
+            created_at=created_at,
+            inferred_raw_signals=inferred_raw_signals,
+        )
+    except Exception as exc:
+        print(f"Background memory pipeline failed: {exc}")
 
 
 @app.get("/graph/memory/{user_id}")
@@ -2899,6 +3012,9 @@ def chat(
     )
     llm_generation_time_ms = int((time.time() - llm_start) * 1000)
     answer = reply_bundle["text"]
+    relevance_start = time.time()
+    relevance = evaluate_response_relevance(query=req.message, response=answer)
+    relevance_time_ms = int((time.time() - relevance_start) * 1000)
     if memory_hit:
         retrieval_mode = "memory_hit"
     else:
@@ -2908,8 +3024,8 @@ def chat(
     llm_provider = reply_bundle.get("provider", "unknown")
     llm_model = reply_bundle.get("model", "unknown")
 
-    memory_pipeline_started = time.time()
-    memory_pipeline_result = _process_memory_pipeline(
+    background_tasks.add_task(
+        _run_memory_pipeline_background,
         user_id=resolved_user_id,
         conversation_id=conversation_id,
         message=req.message,
@@ -2918,19 +3034,7 @@ def chat(
         created_at=now_iso,
         inferred_raw_signals=inferred_memory_signals,
     )
-    graph_promotion_time_ms = int((time.time() - memory_pipeline_started) * 1000)
-
-    ephemeral_memory = graph_memory_service.fetch_ephemeral_memory(
-        user_id=resolved_user_id,
-        limit=10,
-    )
-
-    with get_session() as session:
-        graph_memory = graph_memory_service.fetch_graph_memory(
-            user_id=resolved_user_id,
-            session=session,
-            limit=10,
-        )
+    graph_promotion_time_ms = 0
     bot_msg_id = str(uuid4())
 
     add_message(
@@ -2981,8 +3085,8 @@ def chat(
         "graph_confidence": round(graph_max_score, 4),
         "graph_promotion_time_ms": graph_promotion_time_ms,
         "signal_extraction_time_ms": 0,
-        "signals_extracted": int(memory_pipeline_result.get("signals_extracted") or 0),
-        "promotion_summary": memory_pipeline_result.get("promotion_summary") or {"status": "completed"},
+        "signals_extracted": 0,
+        "promotion_summary": {"status": "queued", "ephemeral_count": 0, "promoted_count": 0, "promoted_items": []},
         "route": route_decision.to_dict(),
         "topic_match": (
             {
@@ -3005,9 +3109,11 @@ def chat(
         "llm_provider": llm_provider,
         "llm_model": llm_model,
         "llm_generation_time_ms": llm_generation_time_ms,
-        "memory_update_mode": "inline",
+        "answer_relevance": relevance,
+        "answer_relevance_time_ms": relevance_time_ms,
+        "memory_update_mode": "background",
         "ephemeral_backend": graph_memory_service.ephemeral_backend,
-        "ephemeral_memory": ephemeral_memory,
-        "graph_memory": graph_memory,
+        "ephemeral_memory": [],
+        "graph_memory": [],
         "time_ms": int((time.time() - start) * 1000),
     }
