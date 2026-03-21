@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from pathlib import Path
 from uuid import uuid4
 
 from fastapi import BackgroundTasks, Cookie, FastAPI, HTTPException, Response, status
@@ -69,6 +75,261 @@ class CompanyPlannerRequest(BaseModel):
     user_id: str | None = None
     company: str = Field(min_length=2)
     days_left: int | None = Field(default=14)
+
+
+class WceRunRequest(BaseModel):
+    code: str = Field(min_length=1)
+    language: str = Field(min_length=1)
+    input: str = ""
+
+
+class WceAnalyzeRequest(BaseModel):
+    code: str = Field(min_length=1)
+    language: str = Field(min_length=1)
+    problem_name: str | None = None
+
+
+class WceChatRequest(BaseModel):
+    message: str = Field(min_length=1)
+    code: str = ""
+    language: str = "python"
+
+
+SUPPORTED_WCE_LANGUAGES: dict[str, str] = {
+    "python": "Python",
+    "javascript": "JavaScript",
+    "c": "C",
+    "cpp": "C++",
+    "java": "Java",
+}
+
+
+def _wce_normalize_language(language: str) -> str:
+    normalized = (language or "").strip().lower()
+    aliases = {
+        "py": "python",
+        "python3": "python",
+        "js": "javascript",
+        "node": "javascript",
+        "c++": "cpp",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in SUPPORTED_WCE_LANGUAGES:
+        raise HTTPException(status_code=400, detail=f"Unsupported language: {language}")
+    return normalized
+
+
+def _wce_run_process(command: list[str], *, cwd: str | None = None, stdin_text: str = "") -> str:
+    completed = subprocess.run(
+        command,
+        input=stdin_text or "",
+        text=True,
+        capture_output=True,
+        cwd=cwd,
+        timeout=10,
+        check=False,
+    )
+    stdout = (completed.stdout or "").strip()
+    stderr = (completed.stderr or "").strip()
+    combined = stdout or stderr
+    if completed.returncode != 0:
+        raise HTTPException(status_code=500, detail=combined or f"Process exited with code {completed.returncode}")
+    return combined
+
+
+def _wce_require_command(command_name: str) -> str:
+    resolved = shutil.which(command_name)
+    if not resolved:
+        raise HTTPException(status_code=500, detail=f"Required runtime not installed: {command_name}")
+    return resolved
+
+
+def _wce_run_code(*, code: str, language: str, stdin_text: str = "") -> str:
+    language = _wce_normalize_language(language)
+    with tempfile.TemporaryDirectory(prefix="graphmind-wce-") as temp_dir:
+        temp_path = Path(temp_dir)
+        if language == "python":
+            script_path = temp_path / "main.py"
+            script_path.write_text(code, encoding="utf-8")
+            return _wce_run_process([sys.executable, str(script_path)], stdin_text=stdin_text)
+        if language == "javascript":
+            runtime = _wce_require_command("node")
+            script_path = temp_path / "main.js"
+            script_path.write_text(code, encoding="utf-8")
+            return _wce_run_process([runtime, str(script_path)], stdin_text=stdin_text)
+        if language == "c":
+            compiler = _wce_require_command("gcc")
+            source_path = temp_path / "main.c"
+            executable_path = temp_path / ("main.exe" if sys.platform.startswith("win") else "main")
+            source_path.write_text(code, encoding="utf-8")
+            _wce_run_process([compiler, str(source_path), "-O2", "-o", str(executable_path)])
+            return _wce_run_process([str(executable_path)], stdin_text=stdin_text)
+        if language == "cpp":
+            compiler = _wce_require_command("g++")
+            source_path = temp_path / "main.cpp"
+            executable_path = temp_path / ("main.exe" if sys.platform.startswith("win") else "main")
+            source_path.write_text(code, encoding="utf-8")
+            _wce_run_process([compiler, str(source_path), "-std=c++17", "-O2", "-o", str(executable_path)])
+            return _wce_run_process([str(executable_path)], stdin_text=stdin_text)
+        if language == "java":
+            javac = _wce_require_command("javac")
+            java = _wce_require_command("java")
+            source_path = temp_path / "Main.java"
+            source_path.write_text(code, encoding="utf-8")
+            _wce_run_process([javac, str(source_path)])
+            return _wce_run_process([java, "-cp", temp_dir, "Main"], stdin_text=stdin_text)
+    raise HTTPException(status_code=400, detail=f"Unsupported language: {language}")
+
+
+def _wce_has_nested_loops(normalized_code: str) -> bool:
+    return any(
+        re.search(pattern, normalized_code, re.DOTALL)
+        for pattern in (
+            r"for[\s\S]{0,500}?for",
+            r"for[\s\S]{0,500}?while",
+            r"while[\s\S]{0,500}?for",
+            r"while[\s\S]{0,500}?while",
+        )
+    )
+
+
+def _wce_has_single_loop(normalized_code: str) -> bool:
+    return bool(
+        re.search(r"\bfor\b", normalized_code)
+        or re.search(r"\bwhile\b", normalized_code)
+        or ".foreach(" in normalized_code
+    )
+
+
+def _wce_has_sort(normalized_code: str) -> bool:
+    return "sort(" in normalized_code or "sorted(" in normalized_code or ".sort(" in normalized_code
+
+
+def _wce_has_hash_structures(normalized_code: str) -> bool:
+    return bool(
+        re.search(r"unordered_map|std::unordered_map|hashmap|dictionary|dict\b", normalized_code)
+        or re.search(r"\bnew\s+map\b", normalized_code)
+        or re.search(r"(^|\W)map<.*?>", normalized_code)
+        or re.search(r"\.\s*(get|set)\(", normalized_code)
+    )
+
+
+def _wce_detect_time_complexity(code: str) -> str:
+    normalized_code = code.lower()
+    if _wce_has_nested_loops(normalized_code):
+        return "O(n^2)"
+    if _wce_has_sort(normalized_code):
+        return "O(n log n)"
+    if _wce_has_single_loop(normalized_code):
+        return "O(n)"
+    return "O(1)"
+
+
+def _wce_detect_space_complexity(code: str) -> str:
+    normalized_code = code.lower()
+    if _wce_has_hash_structures(normalized_code) or re.search(r"\bset\b", normalized_code):
+        return "O(n)"
+    return "O(1)"
+
+
+def _wce_detect_approach(code: str) -> str:
+    normalized_code = code.lower()
+    if _wce_has_hash_structures(normalized_code):
+        return "Uses a hash map or dictionary style lookup for fast access."
+    if _wce_has_sort(normalized_code):
+        if re.search(r"\b(left|right|lo|hi|start|end)\b", normalized_code):
+            return "Sorts first, then uses pointer-based scanning."
+        return "Uses sorting before the main search."
+    if _wce_has_nested_loops(normalized_code):
+        return "Uses nested loops to compare multiple candidate pairs."
+    if _wce_has_single_loop(normalized_code):
+        return "Uses a single main pass through the input."
+    return "No strong iteration pattern detected from the current code."
+
+
+def _wce_build_suggestions(code: str, time_complexity: str, approach: str) -> list[str]:
+    suggestions: list[str] = []
+    normalized_code = code.lower()
+    if time_complexity == "O(n^2)":
+        suggestions.append("This looks quadratic. If the problem allows it, try a hash-map based approach.")
+    elif time_complexity == "O(n log n)":
+        suggestions.append("Sorting is solid, but a hash-map can often reduce this to O(n).")
+    elif time_complexity == "O(n)":
+        suggestions.append("Complexity looks healthy. Focus on edge cases like duplicates, empty input, or missing matches.")
+    else:
+        suggestions.append("Double-check that the code really covers variable-size input efficiently.")
+    if "hash map" in approach.lower():
+        suggestions.append("Make sure duplicate values and repeated lookups are handled correctly.")
+    if "pointer" in approach.lower():
+        suggestions.append("Verify pointer movement carefully so valid answers are not skipped.")
+    if "return" not in normalized_code:
+        suggestions.append("The code may not return a final result on every path.")
+    if re.search(r"\b(todo|pass|write your solution here)\b", normalized_code):
+        suggestions.append("There is still placeholder logic to replace.")
+    return suggestions
+
+
+def _wce_calculate_score(code: str, time_complexity: str) -> int:
+    normalized_code = code.lower()
+    if re.search(r"\b(todo|pass|write your solution here)\b", normalized_code):
+        return 20
+    score = 78
+    if time_complexity == "O(n)":
+        score += 15
+    elif time_complexity == "O(n log n)":
+        score += 8
+    elif time_complexity == "O(n^2)":
+        score -= 10
+    if re.search(r"map|unordered_map|dictionary|dict", normalized_code):
+        score += 5
+    if "return" not in normalized_code:
+        score -= 20
+    return max(0, min(100, score))
+
+
+def _wce_build_analysis(code: str, language: str, problem_name: str | None = None) -> dict[str, object]:
+    time_complexity = _wce_detect_time_complexity(code)
+    approach = _wce_detect_approach(code)
+    suggestions = _wce_build_suggestions(code, time_complexity, approach)
+    return {
+        "language": _wce_normalize_language(language),
+        "problemName": problem_name or "General code",
+        "approach": approach,
+        "timeComplexity": time_complexity,
+        "spaceComplexity": _wce_detect_space_complexity(code),
+        "suggestions": suggestions,
+        "score": _wce_calculate_score(code, time_complexity),
+    }
+
+
+def _wce_chat_response(message: str, code: str, language: str) -> str:
+    clean_code = code or ""
+    if not clean_code.strip():
+        return "Add code in the workspace first, then ask about complexity, bugs, or optimization."
+    analysis = _wce_build_analysis(clean_code, language)
+    normalized_message = (message or "").lower()
+    if "time" in normalized_message or "complex" in normalized_message:
+        return (
+            f"For this {analysis['language']} code, the estimated time complexity is {analysis['timeComplexity']} "
+            f"and the space complexity is {analysis['spaceComplexity']}."
+        )
+    if any(word in normalized_message for word in ("improve", "optimize", "better")):
+        return " ".join(str(item) for item in analysis["suggestions"])
+    if any(word in normalized_message for word in ("approach", "method", "used")):
+        return (
+            f"Detected approach: {analysis['approach']} "
+            f"Estimated complexity: {analysis['timeComplexity']} time and {analysis['spaceComplexity']} space."
+        )
+    if any(word in normalized_message for word in ("correct", "bug", "wrong")):
+        return (
+            "I cannot guarantee correctness without tests, but the code looks like this: "
+            f"{analysis['approach']} Main improvement areas: {' '.join(str(item) for item in analysis['suggestions'])}"
+        )
+    return (
+        f"Quick review: {analysis['approach']} "
+        f"Estimated complexity is {analysis['timeComplexity']} time and {analysis['spaceComplexity']} space. "
+        f"{' '.join(str(item) for item in analysis['suggestions'])}"
+    )
 
 
 @app.on_event("startup")
@@ -860,6 +1121,87 @@ def chat_ui() -> str:
     .plannerSummaryGrid{display:grid; gap:10px;}
     .plannerActiveBtn{display:none;}
     .plannerActiveBtn.show{display:inline-flex;}
+    .workspaceShell{
+      display:flex;
+      flex-direction:column;
+      gap:12px;
+    }
+    .workspaceControls{
+      display:grid;
+      grid-template-columns:repeat(2, minmax(0, 1fr));
+      gap:10px;
+    }
+    .workspaceControls .field,
+    .workspaceControls .plannerInput{
+      width:100%;
+    }
+    .workspaceActions{
+      display:flex;
+      gap:8px;
+      flex-wrap:wrap;
+    }
+    .workspaceEditor,
+    .workspaceOutput,
+    .workspaceChatInput{
+      width:100%;
+      min-height:140px;
+      border:1px solid rgba(148,163,184,.16);
+      background:rgba(5,14,23,.92);
+      color:var(--text);
+      border-radius:18px;
+      padding:12px 14px;
+      font:13px/1.55 "Cascadia Code","Consolas",monospace;
+      resize:vertical;
+    }
+    .workspaceOutput{
+      min-height:120px;
+    }
+    .workspaceChatInput{
+      min-height:78px;
+    }
+    .workspaceSplit{
+      display:grid;
+      grid-template-columns:1fr;
+      gap:12px;
+    }
+    .workspaceCard{
+      padding:12px;
+      border-radius:18px;
+      border:1px solid rgba(148,163,184,.12);
+      background:linear-gradient(180deg, rgba(16,28,43,.94), rgba(8,16,27,.96));
+    }
+    .workspaceChatFeed{
+      display:flex;
+      flex-direction:column;
+      gap:10px;
+      max-height:220px;
+      overflow:auto;
+      margin-bottom:10px;
+    }
+    .workspaceBubble{
+      padding:10px 12px;
+      border-radius:16px;
+      font-size:12px;
+      line-height:1.6;
+      white-space:pre-wrap;
+    }
+    .workspaceBubble.user{
+      background:linear-gradient(135deg, #7dd3fc, #38bdf8);
+      color:#032033;
+    }
+    .workspaceBubble.bot{
+      background:rgba(9,18,30,.86);
+      border:1px solid rgba(148,163,184,.14);
+      color:var(--text);
+    }
+    .workspaceMeta{
+      display:flex;
+      justify-content:space-between;
+      gap:10px;
+      flex-wrap:wrap;
+      font-size:11px;
+      color:var(--muted);
+    }
     @media (max-width: 1240px){
       body{overflow:auto; height:auto;}
       .app{height:auto; min-height:calc(100vh - 32px);}
@@ -888,6 +1230,7 @@ def chat_ui() -> str:
       .msg{max-width:92%;}
       .summaryHero{flex-direction:column;}
       .plannerBody{grid-template-columns:1fr;}
+      .workspaceControls{grid-template-columns:1fr;}
     }
   </style>
 </head>
@@ -914,6 +1257,7 @@ def chat_ui() -> str:
         <span class="hiddenMeta pill">Ephemeral: <code id="backendLabel"></code></span>
         <span class="hiddenMeta pill">LLM: <code id="llmLabel">unknown</code></span>
         <button class="btn" id="newChat">New chat</button>
+        <button class="btn" id="openWceBtn">Code Arena</button>
         <button class="btn" id="openPlannerBtn">Company planner</button>
         <button class="btn plannerActiveBtn" id="activePlannerBtn">Open planner</button>
         <button class="btn" id="refreshMemory">Refresh memory</button>
@@ -946,6 +1290,61 @@ def chat_ui() -> str:
         </div>
       </div>
       <div class="memory">
+        <div class="panel" style="display:none;">
+          <div class="panelHead">
+            <h3>WCE Workspace</h3>
+            <span class="tiny" id="wceStatus">Ready to run code</span>
+          </div>
+          <div class="workspaceShell">
+            <div class="workspaceControls">
+              <select class="plannerInput" id="wceLanguage">
+                <option value="python">Python</option>
+                <option value="javascript">JavaScript</option>
+                <option value="c">C</option>
+                <option value="cpp">C++</option>
+                <option value="java">Java</option>
+              </select>
+              <input class="plannerInput" id="wceProblemName" type="text" value="General code" placeholder="Problem name">
+            </div>
+            <textarea class="workspaceEditor" id="wceCode" spellcheck="false">print("Hello, World!")</textarea>
+            <div class="workspaceControls">
+              <textarea class="workspaceChatInput" id="wceInput" spellcheck="false" placeholder="Optional stdin input"></textarea>
+              <div class="workspaceCard">
+                <div class="workspaceActions">
+                  <button class="btn" id="wceRunBtn" type="button">Run</button>
+                  <button class="btn" id="wceAnalyzeBtn" type="button">Analyze</button>
+                  <button class="btn" id="wceClearBtn" type="button">Clear output</button>
+                </div>
+                <div class="workspaceMeta" style="margin-top:10px;">
+                  <span id="wceScore">Score: --</span>
+                  <span id="wceComplexity">Complexity: --</span>
+                </div>
+              </div>
+            </div>
+            <div class="workspaceSplit">
+              <div class="workspaceCard">
+                <div class="panelHead">
+                  <h3>Output</h3>
+                  <span class="tiny">Program stdout or errors</span>
+                </div>
+                <textarea class="workspaceOutput" id="wceOutput" readonly placeholder="Run your code to see output"></textarea>
+              </div>
+              <div class="workspaceCard">
+                <div class="panelHead">
+                  <h3>Code Assistant</h3>
+                  <span class="tiny">Ask about bugs, complexity, or improvements</span>
+                </div>
+                <div class="workspaceChatFeed" id="wceChatFeed">
+                  <div class="workspaceBubble bot">Ask about the code in this editor and I’ll review it with the backend analysis.</div>
+                </div>
+                <textarea class="workspaceChatInput" id="wceChatInput" spellcheck="false" placeholder="Example: what is the time complexity?"></textarea>
+                <div class="workspaceActions">
+                  <button class="btn" id="wceChatBtn" type="button">Ask</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
         <div class="panel">
           <div class="panelHead">
             <h3>Last Promotion</h3>
@@ -1073,6 +1472,7 @@ def chat_ui() -> str:
   const graphModalCanvas = document.getElementById('graphModalCanvas');
   const maximizeGraphBtn = document.getElementById('maximizeGraph');
   const closeGraphModalBtn = document.getElementById('closeGraphModal');
+  const openWceBtn = document.getElementById('openWceBtn');
   const openPlannerBtn = document.getElementById('openPlannerBtn');
   const activePlannerBtn = document.getElementById('activePlannerBtn');
   const plannerModal = document.getElementById('plannerModal');
@@ -1098,6 +1498,20 @@ def chat_ui() -> str:
   const registerBtn = document.getElementById('registerBtn');
   const logoutBtn = document.getElementById('logoutBtn');
   const conversationList = document.getElementById('conversationList');
+  const wceLanguage = document.getElementById('wceLanguage');
+  const wceProblemName = document.getElementById('wceProblemName');
+  const wceCode = document.getElementById('wceCode');
+  const wceInput = document.getElementById('wceInput');
+  const wceOutput = document.getElementById('wceOutput');
+  const wceRunBtn = document.getElementById('wceRunBtn');
+  const wceAnalyzeBtn = document.getElementById('wceAnalyzeBtn');
+  const wceClearBtn = document.getElementById('wceClearBtn');
+  const wceStatus = document.getElementById('wceStatus');
+  const wceScore = document.getElementById('wceScore');
+  const wceComplexity = document.getElementById('wceComplexity');
+  const wceChatFeed = document.getElementById('wceChatFeed');
+  const wceChatInput = document.getElementById('wceChatInput');
+  const wceChatBtn = document.getElementById('wceChatBtn');
 
   const rand = () => Math.random().toString(36).slice(2,10);
 
@@ -1266,6 +1680,154 @@ def chat_ui() -> str:
   function renderEmpty(target, text) {
     target.innerHTML = '<div class="item tiny">' + text + '</div>';
   }
+
+  const wceDefaultCode = {
+    python: 'print("Hello, World!")',
+    javascript: 'console.log("Hello, World!");',
+    c: '#include <stdio.h>\\n\\nint main() {\\n    printf("Hello, World!\\\\n");\\n    return 0;\\n}',
+    cpp: '#include <iostream>\\nusing namespace std;\\n\\nint main() {\\n    cout << "Hello, World!" << endl;\\n    return 0;\\n}',
+    java: 'public class Main {\\n    public static void main(String[] args) {\\n        System.out.println("Hello, World!");\\n    }\\n}',
+  };
+
+  function wceSetBusy(isBusy, label) {
+    wceRunBtn.disabled = isBusy;
+    wceAnalyzeBtn.disabled = isBusy;
+    wceChatBtn.disabled = isBusy;
+    wceStatus.textContent = label;
+  }
+
+  function wceAppendMessage(sender, text) {
+    const bubble = document.createElement('div');
+    bubble.className = 'workspaceBubble ' + sender;
+    bubble.textContent = text;
+    wceChatFeed.appendChild(bubble);
+    wceChatFeed.scrollTop = wceChatFeed.scrollHeight;
+  }
+
+  function wceApplyAnalysis(analysis) {
+    if (!analysis) return;
+    const score = analysis.score ?? '--';
+    const timeComplexity = analysis.timeComplexity || '--';
+    const spaceComplexity = analysis.spaceComplexity || '--';
+    wceScore.textContent = 'Score: ' + score;
+    wceComplexity.textContent = 'Complexity: ' + timeComplexity + ' time / ' + spaceComplexity + ' space';
+  }
+
+  async function wcePost(path, payload) {
+    const res = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data?.detail || data?.error || 'Request failed.');
+    }
+    return data;
+  }
+
+  async function runWceCode() {
+    if (!wceCode.value.trim()) {
+      wceStatus.textContent = 'Add code before running.';
+      return;
+    }
+    wceSetBusy(true, 'Running code...');
+    try {
+      const data = await wcePost('/wce/run', {
+        code: wceCode.value,
+        language: wceLanguage.value,
+        input: wceInput.value || ''
+      });
+      wceOutput.value = data.output || '';
+      wceStatus.textContent = 'Execution complete.';
+    } catch (e) {
+      wceOutput.value = e.message || 'Execution failed.';
+      wceStatus.textContent = 'Run failed.';
+    } finally {
+      wceSetBusy(false, wceStatus.textContent);
+    }
+  }
+
+  async function analyzeWceCode() {
+    if (!wceCode.value.trim()) {
+      wceStatus.textContent = 'Add code before analysis.';
+      return;
+    }
+    wceSetBusy(true, 'Analyzing code...');
+    try {
+      const data = await wcePost('/wce/analyze', {
+        code: wceCode.value,
+        language: wceLanguage.value,
+        problem_name: wceProblemName.value || 'General code'
+      });
+      wceApplyAnalysis(data);
+      const suggestions = Array.isArray(data.suggestions) ? data.suggestions.join(' ') : '';
+      wceOutput.value = [
+        'Approach: ' + (data.approach || '--'),
+        'Time Complexity: ' + (data.timeComplexity || '--'),
+        'Space Complexity: ' + (data.spaceComplexity || '--'),
+        '',
+        'Suggestions: ' + (suggestions || 'No suggestions')
+      ].join('\\n');
+      wceStatus.textContent = 'Analysis ready.';
+    } catch (e) {
+      wceOutput.value = e.message || 'Analysis failed.';
+      wceStatus.textContent = 'Analysis failed.';
+    } finally {
+      wceSetBusy(false, wceStatus.textContent);
+    }
+  }
+
+  async function askWceChat() {
+    const message = (wceChatInput.value || '').trim();
+    if (!message) {
+      wceStatus.textContent = 'Type a question for the code assistant.';
+      return;
+    }
+    wceAppendMessage('user', message);
+    wceChatInput.value = '';
+    wceSetBusy(true, 'Thinking about your code...');
+    try {
+      const data = await wcePost('/wce/chat', {
+        message,
+        code: wceCode.value || '',
+        language: wceLanguage.value
+      });
+      wceApplyAnalysis(data.analysis);
+      wceAppendMessage('bot', data.response || 'No response returned.');
+      wceStatus.textContent = 'Assistant replied.';
+    } catch (e) {
+      wceAppendMessage('bot', e.message || 'Unable to answer right now.');
+      wceStatus.textContent = 'Assistant failed.';
+    } finally {
+      wceSetBusy(false, wceStatus.textContent);
+    }
+  }
+
+  wceLanguage.addEventListener('change', () => {
+    const nextValue = wceDefaultCode[wceLanguage.value];
+    if (nextValue) {
+      wceCode.value = nextValue;
+    }
+    wceOutput.value = '';
+    wceScore.textContent = 'Score: --';
+    wceComplexity.textContent = 'Complexity: --';
+    wceStatus.textContent = 'Language updated.';
+  });
+
+  wceRunBtn.addEventListener('click', runWceCode);
+  wceAnalyzeBtn.addEventListener('click', analyzeWceCode);
+  wceChatBtn.addEventListener('click', askWceChat);
+  wceClearBtn.addEventListener('click', () => {
+    wceOutput.value = '';
+    wceStatus.textContent = 'Output cleared.';
+  });
+  wceChatInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      askWceChat();
+    }
+  });
 
   function plannerStorageKey() {
     return 'graphmind_planner_' + (userId || 'guest');
@@ -2033,6 +2595,9 @@ def chat_ui() -> str:
     loadConversationList();
     input.focus();
   });
+  openWceBtn.addEventListener('click', () => {
+    window.location.href = '/wce-ui';
+  });
 
   function add(text, role) {
     const div = document.createElement('div');
@@ -2288,6 +2853,554 @@ def chat_ui() -> str:
   hydrateSession();
 })();
 </script>
+</body>
+</html>
+"""
+
+
+@app.get("/wce-ui", response_class=HTMLResponse)
+def wce_ui() -> str:
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Code Arena</title>
+  <style>
+    :root{
+      color-scheme:dark;
+      --bg:#07111d;
+      --panel:#0d1726;
+      --panel-soft:#111f33;
+      --border:rgba(148,163,184,.16);
+      --text:#eef6ff;
+      --muted:#8ea6bc;
+      --cyan:#38bdf8;
+      --cyan-soft:rgba(56,189,248,.12);
+      --green:#34d399;
+      --shadow:0 30px 80px rgba(2,8,20,.45);
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0;
+      min-height:100vh;
+      font-family:"Segoe UI Variable Display","Segoe UI",Tahoma,sans-serif;
+      color:var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(56,189,248,.16), transparent 26%),
+        radial-gradient(circle at bottom right, rgba(52,211,153,.12), transparent 24%),
+        linear-gradient(180deg, #0b1829, var(--bg));
+      padding:18px;
+    }
+    .app{
+      max-width:1540px;
+      margin:0 auto;
+      min-height:calc(100vh - 36px);
+      display:grid;
+      grid-template-rows:auto minmax(0,1fr);
+      gap:16px;
+    }
+    .topbar{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:14px;
+      flex-wrap:wrap;
+      padding:18px 22px;
+      border:1px solid var(--border);
+      border-radius:28px;
+      background:linear-gradient(180deg, rgba(15,27,43,.96), rgba(8,16,28,.98));
+      box-shadow:var(--shadow);
+    }
+    .titleWrap{display:flex; flex-direction:column; gap:6px;}
+    .eyebrow{
+      font-size:11px;
+      letter-spacing:.24em;
+      text-transform:uppercase;
+      color:#8ddcff;
+      font-weight:700;
+    }
+    .title{
+      font-size:34px;
+      font-weight:780;
+      letter-spacing:-.03em;
+      margin:0;
+    }
+    .subtitle{
+      color:var(--muted);
+      font-size:13px;
+      max-width:720px;
+      line-height:1.6;
+    }
+    .topActions{
+      display:flex;
+      gap:10px;
+      flex-wrap:wrap;
+      align-items:center;
+    }
+    .btn,
+    .select,
+    .input{
+      border:1px solid var(--border);
+      border-radius:16px;
+      background:rgba(8,18,30,.9);
+      color:var(--text);
+      padding:11px 14px;
+      font:inherit;
+    }
+    .btn{
+      cursor:pointer;
+      font-weight:650;
+      transition:transform .14s ease, border-color .14s ease;
+    }
+    .btn:hover{
+      transform:translateY(-1px);
+      border-color:rgba(125,211,252,.45);
+    }
+    .btn.primary{
+      background:linear-gradient(135deg, #67d8ff, #38bdf8 55%, #0ea5e9);
+      color:#032136;
+      border:none;
+      box-shadow:0 16px 36px rgba(56,189,248,.26);
+    }
+    .btn.success{
+      background:linear-gradient(135deg, rgba(52,211,153,.22), rgba(16,185,129,.18));
+      border-color:rgba(52,211,153,.36);
+      color:#d7fff1;
+    }
+    .workspace{
+      min-height:0;
+      display:grid;
+      grid-template-columns:minmax(0,1.3fr) minmax(360px,.7fr);
+      gap:16px;
+    }
+    .panel{
+      border:1px solid var(--border);
+      border-radius:28px;
+      background:linear-gradient(180deg, rgba(15,27,43,.96), rgba(8,16,28,.98));
+      box-shadow:var(--shadow);
+      padding:18px;
+      min-height:0;
+    }
+    .leftCol,.rightCol{
+      min-height:0;
+      display:grid;
+      gap:16px;
+    }
+    .leftCol{grid-template-rows:auto minmax(0,1fr) auto;}
+    .rightCol{grid-template-rows:auto minmax(0,1fr) auto;}
+    .controls{
+      display:grid;
+      grid-template-columns:180px minmax(0,1fr) 160px 150px;
+      gap:10px;
+    }
+    .editor{
+      width:100%;
+      height:100%;
+      min-height:560px;
+      border:1px solid rgba(148,163,184,.14);
+      border-radius:22px;
+      background:linear-gradient(180deg, #081321, #06111c);
+      color:#f8fbff;
+      padding:18px;
+      resize:none;
+      font:14px/1.65 "Cascadia Code","Consolas",monospace;
+      outline:none;
+    }
+    .sectionTitle{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:10px;
+      margin-bottom:12px;
+    }
+    .sectionTitle h2,
+    .sectionTitle h3{
+      margin:0;
+      font-size:18px;
+      letter-spacing:-.02em;
+    }
+    .tiny{
+      font-size:12px;
+      color:var(--muted);
+    }
+    .output,
+    .stdin,
+    .chatInput{
+      width:100%;
+      border:1px solid rgba(148,163,184,.14);
+      border-radius:20px;
+      background:#081321;
+      color:var(--text);
+      padding:14px;
+      resize:vertical;
+      font:13px/1.6 "Cascadia Code","Consolas",monospace;
+      outline:none;
+    }
+    .stdin{min-height:90px;}
+    .output{min-height:200px;}
+    .cardGrid{
+      display:grid;
+      grid-template-columns:repeat(2, minmax(0,1fr));
+      gap:10px;
+    }
+    .metric{
+      padding:14px;
+      border-radius:18px;
+      border:1px solid rgba(148,163,184,.12);
+      background:linear-gradient(180deg, rgba(17,31,51,.9), rgba(10,19,31,.94));
+    }
+    .metric b{
+      display:block;
+      margin-bottom:6px;
+      font-size:12px;
+      color:var(--muted);
+      font-weight:600;
+    }
+    .metric span{
+      font-size:18px;
+      font-weight:720;
+    }
+    .analysisBox{
+      padding:16px;
+      border-radius:22px;
+      border:1px solid rgba(148,163,184,.12);
+      background:linear-gradient(180deg, rgba(17,31,51,.9), rgba(10,19,31,.94));
+      color:var(--muted);
+      font-size:13px;
+      line-height:1.75;
+      min-height:190px;
+      white-space:pre-wrap;
+    }
+    .chatFeed{
+      min-height:0;
+      overflow:auto;
+      display:flex;
+      flex-direction:column;
+      gap:10px;
+      padding-right:4px;
+    }
+    .bubble{
+      padding:12px 14px;
+      border-radius:18px;
+      font-size:13px;
+      line-height:1.7;
+      white-space:pre-wrap;
+      max-width:92%;
+    }
+    .bubble.user{
+      align-self:flex-end;
+      background:linear-gradient(135deg, #7dd3fc, #38bdf8);
+      color:#032136;
+    }
+    .bubble.bot{
+      align-self:flex-start;
+      background:linear-gradient(180deg, rgba(18,31,47,.98), rgba(9,18,30,.98));
+      border:1px solid rgba(148,163,184,.14);
+      color:var(--text);
+    }
+    .composer{
+      display:grid;
+      gap:10px;
+    }
+    .chatInput{
+      min-height:96px;
+    }
+    .statusbar{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:10px;
+      flex-wrap:wrap;
+      color:var(--muted);
+      font-size:12px;
+    }
+    .pill{
+      display:inline-flex;
+      align-items:center;
+      gap:8px;
+      padding:8px 12px;
+      border-radius:999px;
+      border:1px solid rgba(148,163,184,.12);
+      background:rgba(8,18,30,.7);
+    }
+    @media (max-width: 1120px){
+      .workspace{grid-template-columns:1fr;}
+      .controls{grid-template-columns:1fr 1fr;}
+      .editor{min-height:420px;}
+    }
+    @media (max-width: 720px){
+      body{padding:12px;}
+      .app{min-height:calc(100vh - 24px);}
+      .controls{grid-template-columns:1fr;}
+      .cardGrid{grid-template-columns:1fr;}
+      .title{font-size:28px;}
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="topbar">
+      <div class="titleWrap">
+        <div class="eyebrow">Solve / Analyze / Improve</div>
+        <h1 class="title"><span style="color:#38bdf8;">Code</span> Arena</h1>
+        <div class="subtitle">Write, run, and test your code in multiple programming languages. Choose a language from the dropdown and start coding.</div>
+      </div>
+      <div class="topActions">
+        <a href="/chat-ui" class="btn" style="text-decoration:none;">Back to GraphMind</a>
+        <button class="btn success" id="analyzeBtn" type="button">Analyze</button>
+        <button class="btn primary" id="runBtn" type="button">Run code</button>
+      </div>
+    </div>
+
+    <div class="workspace">
+      <div class="leftCol">
+        <div class="panel">
+          <div class="controls">
+            <select class="select" id="language">
+              <option value="python">Python</option>
+              <option value="javascript">JavaScript</option>
+              <option value="c">C</option>
+              <option value="cpp">C++</option>
+              <option value="java">Java</option>
+            </select>
+            <input class="input" id="problemName" type="text" value="General code" placeholder="Problem name">
+            <button class="btn" id="resetCodeBtn" type="button">Reset code</button>
+            <button class="btn" id="clearOutputBtn" type="button">Clear output</button>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="sectionTitle">
+            <h2>Editor</h2>
+            <span class="tiny" id="editorStatus">Ready</span>
+          </div>
+          <textarea class="editor" id="code" spellcheck="false">print("Hello, World!")</textarea>
+        </div>
+
+        <div class="panel">
+          <div class="sectionTitle">
+            <h3>Program Output</h3>
+            <span class="tiny">Optional stdin is supported below</span>
+          </div>
+          <textarea class="stdin" id="stdin" spellcheck="false" placeholder="Optional input passed to your program"></textarea>
+          <div style="height:10px;"></div>
+          <textarea class="output" id="output" readonly placeholder="Run your code to see stdout or errors"></textarea>
+        </div>
+      </div>
+
+      <div class="rightCol">
+        <div class="panel">
+          <div class="sectionTitle">
+            <h3>Analysis</h3>
+            <span class="tiny">Algorithm review and complexity snapshot</span>
+          </div>
+          <div class="cardGrid">
+            <div class="metric"><b>Score</b><span id="score">--</span></div>
+            <div class="metric"><b>Complexity</b><span id="complexity">--</span></div>
+          </div>
+          <div style="height:10px;"></div>
+          <div class="analysisBox" id="analysis">Run Analyze to see approach, time complexity, space complexity, and improvement suggestions.</div>
+        </div>
+
+        <div class="panel">
+          <div class="sectionTitle">
+            <h3>Code Assistant</h3>
+            <span class="tiny">Ask about bugs, optimization, or method used</span>
+          </div>
+          <div class="chatFeed" id="chatFeed">
+            <div class="bubble bot">I can explain your current solution, estimate complexity, and suggest improvements.</div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="composer">
+            <textarea class="chatInput" id="chatInput" spellcheck="false" placeholder="Example: what is the time complexity of this solution?"></textarea>
+            <div class="statusbar">
+              <span class="pill" id="chatStatus">Assistant ready</span>
+              <button class="btn primary" id="askBtn" type="button">Ask</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+  (() => {
+    const language = document.getElementById('language');
+    const problemName = document.getElementById('problemName');
+    const code = document.getElementById('code');
+    const stdin = document.getElementById('stdin');
+    const output = document.getElementById('output');
+    const analysis = document.getElementById('analysis');
+    const score = document.getElementById('score');
+    const complexity = document.getElementById('complexity');
+    const runBtn = document.getElementById('runBtn');
+    const analyzeBtn = document.getElementById('analyzeBtn');
+    const askBtn = document.getElementById('askBtn');
+    const resetCodeBtn = document.getElementById('resetCodeBtn');
+    const clearOutputBtn = document.getElementById('clearOutputBtn');
+    const editorStatus = document.getElementById('editorStatus');
+    const chatFeed = document.getElementById('chatFeed');
+    const chatInput = document.getElementById('chatInput');
+    const chatStatus = document.getElementById('chatStatus');
+
+    const defaults = {
+      python: 'print("Hello, World!")',
+      javascript: 'console.log("Hello, World!");',
+      c: '#include <stdio.h>\\n\\nint main() {\\n    printf("Hello, World!\\\\n");\\n    return 0;\\n}',
+      cpp: '#include <iostream>\\nusing namespace std;\\n\\nint main() {\\n    cout << "Hello, World!" << endl;\\n    return 0;\\n}',
+      java: 'public class Main {\\n    public static void main(String[] args) {\\n        System.out.println("Hello, World!");\\n    }\\n}',
+    };
+
+    function setBusy(isBusy, label) {
+      runBtn.disabled = isBusy;
+      analyzeBtn.disabled = isBusy;
+      askBtn.disabled = isBusy;
+      editorStatus.textContent = label;
+      chatStatus.textContent = isBusy ? label : 'Assistant ready';
+    }
+
+    function appendChat(role, text) {
+      const div = document.createElement('div');
+      div.className = 'bubble ' + role;
+      div.textContent = text;
+      chatFeed.appendChild(div);
+      chatFeed.scrollTop = chatFeed.scrollHeight;
+    }
+
+    function applyAnalysis(payload) {
+      if (!payload) return;
+      score.textContent = String(payload.score ?? '--');
+      const timeValue = payload.timeComplexity || '--';
+      const spaceValue = payload.spaceComplexity || '--';
+      complexity.textContent = timeValue + ' / ' + spaceValue;
+      const suggestionText = Array.isArray(payload.suggestions) && payload.suggestions.length
+        ? payload.suggestions.map((item) => '- ' + item).join('\\n')
+        : '- No suggestions returned';
+      analysis.textContent = [
+        'Approach: ' + (payload.approach || '--'),
+        'Problem: ' + (payload.problemName || '--'),
+        'Language: ' + (payload.language || '--'),
+        '',
+        'Suggestions:',
+        suggestionText
+      ].join('\\n');
+    }
+
+    async function postJson(path, payload) {
+      const res = await fetch(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.detail || data?.error || 'Request failed.');
+      }
+      return data;
+    }
+
+    async function runCode() {
+      if (!code.value.trim()) {
+        editorStatus.textContent = 'Add code before running.';
+        return;
+      }
+      setBusy(true, 'Running code...');
+      try {
+        const data = await postJson('/wce/run', {
+          code: code.value,
+          language: language.value,
+          input: stdin.value || ''
+        });
+        output.value = data.output || '';
+        editorStatus.textContent = 'Execution complete.';
+      } catch (error) {
+        output.value = error.message || 'Execution failed.';
+        editorStatus.textContent = 'Run failed.';
+      } finally {
+        setBusy(false, editorStatus.textContent);
+      }
+    }
+
+    async function analyzeCode() {
+      if (!code.value.trim()) {
+        editorStatus.textContent = 'Add code before analysis.';
+        return;
+      }
+      setBusy(true, 'Analyzing code...');
+      try {
+        const data = await postJson('/wce/analyze', {
+          code: code.value,
+          language: language.value,
+          problem_name: problemName.value || 'General code'
+        });
+        applyAnalysis(data);
+        editorStatus.textContent = 'Analysis ready.';
+      } catch (error) {
+        analysis.textContent = error.message || 'Analysis failed.';
+        editorStatus.textContent = 'Analysis failed.';
+      } finally {
+        setBusy(false, editorStatus.textContent);
+      }
+    }
+
+    async function askAssistant() {
+      const message = (chatInput.value || '').trim();
+      if (!message) {
+        chatStatus.textContent = 'Type a question first.';
+        return;
+      }
+      appendChat('user', message);
+      chatInput.value = '';
+      setBusy(true, 'Thinking...');
+      try {
+        const data = await postJson('/wce/chat', {
+          message,
+          code: code.value || '',
+          language: language.value
+        });
+        appendChat('bot', data.response || 'No response returned.');
+        applyAnalysis(data.analysis);
+        editorStatus.textContent = 'Assistant replied.';
+      } catch (error) {
+        appendChat('bot', error.message || 'Assistant failed.');
+        editorStatus.textContent = 'Assistant failed.';
+      } finally {
+        setBusy(false, editorStatus.textContent);
+      }
+    }
+
+    language.addEventListener('change', () => {
+      code.value = defaults[language.value] || '';
+      output.value = '';
+      analysis.textContent = 'Run Analyze to see approach, time complexity, space complexity, and improvement suggestions.';
+      score.textContent = '--';
+      complexity.textContent = '--';
+      editorStatus.textContent = 'Language updated.';
+    });
+
+    runBtn.addEventListener('click', runCode);
+    analyzeBtn.addEventListener('click', analyzeCode);
+    askBtn.addEventListener('click', askAssistant);
+    resetCodeBtn.addEventListener('click', () => {
+      code.value = defaults[language.value] || '';
+      editorStatus.textContent = 'Editor reset.';
+    });
+    clearOutputBtn.addEventListener('click', () => {
+      output.value = '';
+      editorStatus.textContent = 'Output cleared.';
+    });
+    chatInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' && !event.shiftKey) {
+        event.preventDefault();
+        askAssistant();
+      }
+    });
+  })();
+  </script>
 </body>
 </html>
 """
@@ -2851,6 +3964,31 @@ def company_planner(
         "sources": web_results,
         "memory_facts": memory_facts,
         "profile_summary": profile_summary,
+    }
+
+
+@app.post("/wce/run")
+def wce_run(req: WceRunRequest) -> dict[str, object]:
+    try:
+        output = _wce_run_code(code=req.code, language=req.language, stdin_text=req.input)
+        return {
+            "language": _wce_normalize_language(req.language),
+            "output": output,
+        }
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(status_code=500, detail="Code execution timed out after 10 seconds.") from exc
+
+
+@app.post("/wce/analyze")
+def wce_analyze(req: WceAnalyzeRequest) -> dict[str, object]:
+    return _wce_build_analysis(req.code, req.language, req.problem_name)
+
+
+@app.post("/wce/chat")
+def wce_chat(req: WceChatRequest) -> dict[str, object]:
+    return {
+        "response": _wce_chat_response(req.message, req.code, req.language),
+        "analysis": _wce_build_analysis(req.code or "", req.language),
     }
 
 
